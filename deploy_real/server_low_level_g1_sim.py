@@ -11,6 +11,7 @@ import mujoco.viewer as mjv
 from tqdm import tqdm
 import os
 from data_utils.rot_utils import quatToEuler
+from data_utils.params import DEFAULT_MIMIC_OBS
 
 try:
     import onnxruntime as ort
@@ -153,6 +154,7 @@ class RealTimePolicyController:
 
         # Training: JointPositionActionCfg(scale=0.25, use_default_offset=True)
         #   -> pd_target = raw_action * 0.25 + default_dof_pos
+        # self.action_scale = np.full(self.num_actions, 0.25, dtype=np.float32)
         self.action_scale = np.full(self.num_actions, 0.25, dtype=np.float32)
 
         # ------------------------------------------------------------------
@@ -322,6 +324,14 @@ class RealTimePolicyController:
         self.redis_pipeline.set("state_body_unitree_g1_with_hands", json.dumps(initial_state_body.tolist()))
         self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
         self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
+
+        # Seed action_* Redis keys with the idle default so we don't chase a stale
+        # target left over from a prior motion server session.
+        default_mimic_obs = DEFAULT_MIMIC_OBS["unitree_g1_with_hands"]
+        self.redis_pipeline.set("action_body_unitree_g1_with_hands", json.dumps(default_mimic_obs.tolist()))
+        self.redis_pipeline.set("action_hand_left_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
+        self.redis_pipeline.set("action_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
+        self.redis_pipeline.set("action_neck_unitree_g1_with_hands", json.dumps(np.zeros(2).tolist()))
         self.redis_pipeline.execute()
 
         measure_fps = self.measure_fps
