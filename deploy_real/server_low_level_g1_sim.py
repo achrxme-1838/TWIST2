@@ -96,7 +96,8 @@ class RealTimePolicyController:
         self.sim_dt = 0.001
         # real frequency = 1 / (decimation * sim_dt)
         # ==> decimation = 1 / (real frequency * sim_dt)
-        self.sim_decimation = 1 / (policy_frequency * self.sim_dt * 4)
+        # self.sim_decimation = 1 / (policy_frequency * self.sim_dt * 4)
+        self.sim_decimation = 1 / (policy_frequency * self.sim_dt)
         print(f"sim_decimation: {self.sim_decimation}")
 
         self.last_action = np.zeros(self.num_actions, dtype=np.float32)
