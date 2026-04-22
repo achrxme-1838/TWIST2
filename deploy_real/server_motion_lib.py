@@ -23,7 +23,11 @@ def build_mimic_obs(
     control_dt: float,
     tar_motion_steps,
     robot_type: str = "g1",
-    mask_indicator: bool = False
+    mask_indicator: bool = False,
+    fix_root_pos: bool = False,
+    fix_root_heading: bool = False,
+    root_pos_ref: torch.Tensor = None,
+    root_rot_ref: torch.Tensor = None,
 ):
     """
     Build the mimic_obs at time-step t_step, referencing the code in MimicRunner.
@@ -33,12 +37,43 @@ def build_mimic_obs(
     motion_times = torch.tensor([t_step * control_dt], device=device).unsqueeze(-1)
     obs_motion_times = tar_motion_steps * control_dt + motion_times
     obs_motion_times = obs_motion_times.flatten()
-    
+
     # Suppose we only have a single motion in the .pkl
     motion_ids = torch.zeros(len(tar_motion_steps), dtype=torch.long, device=device)
-    
+
     # Retrieve motion frames
     root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel, local_key_body_pos, root_pos_delta_local, root_rot_delta_local = motion_lib.calc_motion_frame(motion_ids, obs_motion_times)
+
+    # Align root heading / horizontal position to the reference (motion frame 0), assuming the
+    # robot's root (horizontal) and heading always match the reference motion. root_rot/root_vel/
+    # root_ang_vel are rotated together, so local-frame obs (root_vel_local, roll/pitch,
+    # root_ang_vel_local) remain invariant; only the world-frame outputs used for viz change.
+    if fix_root_heading and root_rot_ref is not None:
+        _, _, yaw_cur = euler_from_quaternion_torch(root_rot, scalar_first=False)
+        _, _, yaw_ref = euler_from_quaternion_torch(root_rot_ref.unsqueeze(0), scalar_first=False)
+        delta_yaw = yaw_ref - yaw_cur  # [N]
+
+        # Rotate quaternion around world z (scalar-last: x, y, z, w)
+        half = delta_yaw * 0.5
+        cw = torch.cos(half)
+        sz = torch.sin(half)
+        x, y, z, w = root_rot[..., 0], root_rot[..., 1], root_rot[..., 2], root_rot[..., 3]
+        root_rot = torch.stack([cw * x - sz * y, sz * x + cw * y, cw * z + sz * w, cw * w - sz * z], dim=-1)
+
+        # Rotate world-frame linear / angular velocities around z by delta_yaw
+        cos_d = torch.cos(delta_yaw)
+        sin_d = torch.sin(delta_yaw)
+        vx, vy, vz = root_vel[..., 0], root_vel[..., 1], root_vel[..., 2]
+        root_vel = torch.stack([cos_d * vx - sin_d * vy, sin_d * vx + cos_d * vy, vz], dim=-1)
+        ax, ay, az = root_ang_vel[..., 0], root_ang_vel[..., 1], root_ang_vel[..., 2]
+        root_ang_vel = torch.stack([cos_d * ax - sin_d * ay, sin_d * ax + cos_d * ay, az], dim=-1)
+
+    if fix_root_pos and root_pos_ref is not None:
+        root_pos = torch.stack([
+            torch.full_like(root_pos[..., 0], float(root_pos_ref[0])),
+            torch.full_like(root_pos[..., 1], float(root_pos_ref[1])),
+            root_pos[..., 2],
+        ], dim=-1)
 
     # Convert to euler (roll, pitch, yaw)
     roll, pitch, yaw = euler_from_quaternion_torch(root_rot, scalar_first=False)
@@ -129,7 +164,18 @@ def main(args, xml_file, robot_base):
 
     # 4. Loop over time steps and publish mimic obs
     control_dt = 0.02
-    
+
+    # 4.1 Cache motion frame 0 as the root-alignment reference for fix_root_pos/fix_root_heading.
+    # Assumes the robot's root (horizontal) and heading always match the reference motion.
+    root_pos_ref = None
+    root_rot_ref = None
+    if args.fix_root_pos or args.fix_root_heading:
+        ref_motion_ids = torch.zeros(len(tar_motion_steps), dtype=torch.long, device=device)
+        ref_times = torch.zeros(len(tar_motion_steps), dtype=torch.float, device=device)
+        root_pos_0, root_rot_0, *_ = motion_lib.calc_motion_frame(ref_motion_ids, ref_times)
+        root_pos_ref = root_pos_0[0].detach().clone()
+        root_rot_ref = root_rot_0[0].detach().clone()
+
     # 4.5 Extract start frame for end frame if option is enabled
     start_frame_mimic_obs = None
     if args.send_start_frame_as_end_frame:
@@ -138,7 +184,11 @@ def main(args, xml_file, robot_base):
             t_step=0,
             control_dt=control_dt,
             tar_motion_steps=tar_motion_steps_tensor,
-            robot_type=args.robot
+            robot_type=args.robot,
+            fix_root_pos=args.fix_root_pos,
+            fix_root_heading=args.fix_root_heading,
+            root_pos_ref=root_pos_ref,
+            root_rot_ref=root_rot_ref,
         )
     # compute num_steps based on motion length
     motion_id = torch.tensor([0], device=device, dtype=torch.long)
@@ -209,8 +259,12 @@ def main(args, xml_file, robot_base):
                 t_step=t_step,
                 control_dt=control_dt,
                 tar_motion_steps=tar_motion_steps_tensor,
-                robot_type=args.robot
-            )   
+                robot_type=args.robot,
+                fix_root_pos=args.fix_root_pos,
+                fix_root_heading=args.fix_root_heading,
+                root_pos_ref=root_pos_ref,
+                root_rot_ref=root_rot_ref,
+            )
             
             # Convert to JSON (list) to put into Redis
             mimic_obs_list = mimic_obs.tolist() if mimic_obs.ndim == 1 else mimic_obs.flatten().tolist()
@@ -291,6 +345,12 @@ if __name__ == "__main__":
     parser.add_argument("--use_remote_control", action="store_true", help="Use remote control signals from robot controller")
     parser.add_argument("--send_start_frame_as_end_frame", action="store_true", help="Use motion's first frame as end frame instead of default pose")
     parser.add_argument("--redis_ip", type=str, default="localhost", help="Redis IP")
+    parser.add_argument("--fix_root_pos", action="store_true",
+                        help="Fix the motion's root horizontal (xy) position to the frame-0 reference. "
+                             "Assumes the robot's horizontal root always matches the reference motion.")
+    parser.add_argument("--fix_root_heading", action="store_true",
+                        help="Fix the motion's root heading (yaw) to the frame-0 reference. "
+                             "Assumes the robot's heading always matches the reference motion.")
     args = parser.parse_args()
 
     args.vis = True

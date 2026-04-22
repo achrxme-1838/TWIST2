@@ -1,5 +1,5 @@
 SCRIPT_DIR=$(dirname $(realpath $0))
-ckpt_path=${SCRIPT_DIR}/assets/ckpts/test/student_prop.onnx
+ckpt_path=${SCRIPT_DIR}/assets/ckpts/test/student_fix_both.onnx
 # ckpt_path=${SCRIPT_DIR}/assets/ckpts/test/student.onnx
 # ckpt_path=${SCRIPT_DIR}/assets/ckpts/twist2_1017_20k.onnx
 # ckpt_path=${SCRIPT_DIR}/assets/ckpts/twist2_1017_25k.onnx

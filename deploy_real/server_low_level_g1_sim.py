@@ -95,7 +95,6 @@ class RealTimePolicyController:
         self.sim_dt = 0.001
         # real frequency = 1 / (decimation * sim_dt)
         # ==> decimation = 1 / (real frequency * sim_dt)
-        # self.sim_decimation = 1 / (policy_frequency * self.sim_dt * 4)
         self.sim_decimation = 1 / (policy_frequency * self.sim_dt * 4)
         print(f"sim_decimation: {self.sim_decimation}")
 
@@ -247,7 +246,7 @@ class RealTimePolicyController:
             "joint_pos_rel", "joint_vel_rel", "last_action",
         ]
 
-        self._mimic_dim = 0 # 35   # TODO: should be removed
+        self._mimic_dim = 35   # TODO: MOTION_OBS
 
         self.total_obs_size = (
             self.history_len * sum(self._hist_dims.values()) + self._mimic_dim
@@ -397,7 +396,7 @@ class RealTimePolicyController:
                         for name in self._hist_term_order
                     ]
                     
-                    # flat_parts.append(action_mimic) # TODO: should be removed
+                    flat_parts.append(action_mimic)   # TODO: MOTION_OBS
 
                     obs_buf = np.concatenate(flat_parts)
 

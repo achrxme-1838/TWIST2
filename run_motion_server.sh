@@ -2,7 +2,8 @@
 
 script_dir=$(dirname $(realpath $0))
 # motion_file="${script_dir}/assets/example_motions/0807_yanjie_walk_005.pkl"
-motion_file="${script_dir}/assets/example_motions/A1-Stand_poses.pkl"
+# motion_file="${script_dir}/assets/example_motions/A1-Stand_poses.pkl"
+motion_file="${script_dir}/assets/example_motions/A6_lift_box_poses.pkl"
 
 
 # Change to deploy_real directory
@@ -19,6 +20,8 @@ python server_motion_lib.py \
     --motion_file ${motion_file} \
     --robot unitree_g1_with_hands \
     --vis \
-    --redis_ip ${redis_ip}
+    --redis_ip ${redis_ip} \
+    --fix_root_pos \
+    --fix_root_heading
     # --send_start_frame_as_end_frame \
     # --use_remote_control \
