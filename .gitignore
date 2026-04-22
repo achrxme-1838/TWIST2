@@ -75,3 +75,6 @@ TWIST2-clean/
 unitree_sdk2/
 
 twist2_demonstration/
+
+assets/ckpts/*
+assets/example_motions/*

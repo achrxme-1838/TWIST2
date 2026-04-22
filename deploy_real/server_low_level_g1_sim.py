@@ -95,83 +95,182 @@ class RealTimePolicyController:
         self.sim_dt = 0.001
         # real frequency = 1 / (decimation * sim_dt)
         # ==> decimation = 1 / (real frequency * sim_dt)
-        self.sim_decimation = 1 / (policy_frequency * self.sim_dt)
+        # self.sim_decimation = 1 / (policy_frequency * self.sim_dt * 4)
+        self.sim_decimation = 1 / (policy_frequency * self.sim_dt * 4)
         print(f"sim_decimation: {self.sim_decimation}")
 
         self.last_action = np.zeros(self.num_actions, dtype=np.float32)
 
         # G1 specific configuration
+        # Values below mirror the Isaac training config at
+        #   DEX_RL_LAB/dex_rl_lab/robots/g1/g1_29dof/configs/g1_29dof_lab_cfg.py
+        # Joint order follows `joint_sdk_names` (== MuJoCo g1_sim2sim_29dof.xml order):
+        #   0-5   left leg  (hip_p, hip_r, hip_y, knee, ankle_p, ankle_r)
+        #   6-11  right leg (hip_p, hip_r, hip_y, knee, ankle_p, ankle_r)
+        #   12-14 torso     (waist_yaw, waist_roll, waist_pitch)
+        #   15-21 left arm  (sh_p, sh_r, sh_y, elbow, wrist_r, wrist_p, wrist_y)
+        #   22-28 right arm (sh_p, sh_r, sh_y, elbow, wrist_r, wrist_p, wrist_y)
         self.default_dof_pos = np.array([
-                -0.2, 0.0, 0.0, 0.4, -0.2, 0.0,  # left leg (6)
-                -0.2, 0.0, 0.0, 0.4, -0.2, 0.0,  # right leg (6)
-                0.0, 0.0, 0.0, # torso (3)
-                0.0, 0.4, 0.0, 1.2, 0.0, 0.0, 0.0, # left arm (7)
-                0.0, -0.4, 0.0, 1.2, 0.0, 0.0, 0.0, # right arm (7)
+                -0.1, 0.0, 0.0, 0.3, -0.2, 0.0,           # left leg
+                -0.1, 0.0, 0.0, 0.3, -0.2, 0.0,           # right leg
+                0.0, 0.0, 0.0,                            # torso
+                0.3, 0.25, 0.0, 0.97, 0.15, 0.0, 0.0,     # left arm
+                0.3, -0.25, 0.0, 0.97, -0.15, 0.0, 0.0,   # right arm
             ])
 
+        # MuJoCo initial qpos: [xyz(3), quat_wxyz(4), joint_pos(29)].
+        # Joint part mirrors default_dof_pos so sim spawns at the training init pose.
         self.mujoco_default_dof_pos = np.concatenate([
             np.array([0, 0, 0.793]),
             np.array([1, 0, 0, 0]),
-             np.array([-0.2, 0.0, 0.0, 0.4, -0.2, 0.0,  # left leg (6)
-                -0.2, 0.0, 0.0, 0.4, -0.2, 0.0,  # right leg (6)
-                0.0, 0.0, 0.0, # torso (3)
-                0.0, 0.2, 0.0, 1.2, 0.0, 0.0, 0.0, # left arm (7)
-                0.0, -0.2, 0.0, 1.2, 0.0, 0.0, 0.0, # right arm (7)
-                ])
+            self.default_dof_pos.copy(),
         ])
 
+        # Kp / Kd from ImplicitActuatorCfg stiffness/damping in the G1 lab cfg.
         self.stiffness = np.array([
-                100, 100, 100, 150, 40, 40,
-                100, 100, 100, 150, 40, 40,
-                150, 150, 150,
-                40, 40, 40, 40, 4.0, 4.0, 4.0,
-                40, 40, 40, 40, 4.0, 4.0, 4.0,
+                100, 100, 100, 150, 40, 40,        # left leg
+                100, 100, 100, 150, 40, 40,        # right leg
+                200, 40, 40,                       # waist_yaw, roll, pitch
+                40, 40, 40, 40, 40, 40, 40,        # left arm
+                40, 40, 40, 40, 40, 40, 40,        # right arm
             ])
         self.damping = np.array([
-                2, 2, 2, 4, 2, 2,
-                2, 2, 2, 4, 2, 2,
-                4, 4, 4,
-                5, 5, 5, 5, 0.2, 0.2, 0.2,
-                5, 5, 5, 5, 0.2, 0.2, 0.2,
+                2, 2, 2, 4, 2, 2,                  # left leg
+                2, 2, 2, 4, 2, 2,                  # right leg
+                5, 5, 5,                           # waist_yaw, roll, pitch
+                1, 1, 1, 1, 1, 1, 1,               # left arm
+                1, 1, 1, 1, 1, 1, 1,               # right arm
             ])
 
-        
+        # Torque limits = effort_limit_sim from each actuator group.
+        # wrist_pitch/yaw use W4010-25 (limit 5); everything else on the arm uses N5020-16 (25).
         self.torque_limits = np.array([
-                100, 100, 100, 150, 40, 40,
-                100, 100, 100, 150, 40, 40,
-                150, 150, 150,
-                40, 40, 40, 40, 4.0, 4.0, 4.0,
-                40, 40, 40, 40, 4.0, 4.0, 4.0,
+                88, 139, 88, 139, 25, 25,          # left leg
+                88, 139, 88, 139, 25, 25,          # right leg
+                88, 25, 25,                        # waist_yaw, roll, pitch
+                25, 25, 25, 25, 25, 5, 5,          # left arm
+                25, 25, 25, 25, 25, 5, 5,          # right arm
             ])
 
-        self.action_scale = np.array([
-                0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
-                0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
-                0.5, 0.5, 0.5,
-                0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
-                0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
-            ])
+        # Training: JointPositionActionCfg(scale=0.25, use_default_offset=True)
+        #   -> pd_target = raw_action * 0.25 + default_dof_pos
+        self.action_scale = np.full(self.num_actions, 0.25, dtype=np.float32)
 
+        # ------------------------------------------------------------------
+        # Joint-order permutation (Isaac <-> MuJoCo/SDK)
+        # ------------------------------------------------------------------
+        # The trained policy operates on Isaac's internal joint order (USD DFS),
+        # which differs from `joint_sdk_names` / MuJoCo XML order. Verified via
+        # DEX_RL_LAB/scripts/check_joint_order.py.
+        #
+        # Everything in THIS file that indexes ``data.qpos`` / ``data.qvel`` /
+        # ``data.ctrl`` stays in MuJoCo (SDK) order. Observations fed to the
+        # policy and raw actions produced by the policy are in Isaac order. We
+        # bridge the two with ``sdk_to_isaac`` / ``isaac_to_sdk``.
+        ISAAC_JOINT_NAMES = [
+            "left_hip_pitch_joint", "right_hip_pitch_joint", "waist_yaw_joint",
+            "left_hip_roll_joint", "right_hip_roll_joint", "waist_roll_joint",
+            "left_hip_yaw_joint", "right_hip_yaw_joint", "waist_pitch_joint",
+            "left_knee_joint", "right_knee_joint",
+            "left_shoulder_pitch_joint", "right_shoulder_pitch_joint",
+            "left_ankle_pitch_joint", "right_ankle_pitch_joint",
+            "left_shoulder_roll_joint", "right_shoulder_roll_joint",
+            "left_ankle_roll_joint", "right_ankle_roll_joint",
+            "left_shoulder_yaw_joint", "right_shoulder_yaw_joint",
+            "left_elbow_joint", "right_elbow_joint",
+            "left_wrist_roll_joint", "right_wrist_roll_joint",
+            "left_wrist_pitch_joint", "right_wrist_pitch_joint",
+            "left_wrist_yaw_joint", "right_wrist_yaw_joint",
+        ]
+        SDK_JOINT_NAMES = [
+            "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+            "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+            "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+            "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+            "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+            "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+            "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+            "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+            "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+        ]
+        #   isaac_ordered = sdk_ordered[self.sdk_to_isaac]
+        #   sdk_ordered   = isaac_ordered[self.isaac_to_sdk]
+        self.sdk_to_isaac = np.array(
+            [SDK_JOINT_NAMES.index(n) for n in ISAAC_JOINT_NAMES], dtype=np.int64
+        )
+        self.isaac_to_sdk = np.array(
+            [ISAAC_JOINT_NAMES.index(n) for n in SDK_JOINT_NAMES], dtype=np.int64
+        )
+
+        # Pre-compute Isaac-order views of constants that the policy sees.
+        self.default_dof_pos_isaac = self.default_dof_pos[self.sdk_to_isaac]
+        # Ankle indices in Isaac order -- used for dof_vel zero-masking to match
+        # the training-side ObsTerm(mask_joint_names=[".*_ankle_pitch_joint", ...]).
+        self.ankle_idx_isaac = [
+            ISAAC_JOINT_NAMES.index(n) for n in (
+                "left_ankle_pitch_joint", "right_ankle_pitch_joint",
+                "left_ankle_roll_joint",  "right_ankle_roll_joint",
+            )
+        ]
+        # Kept for reference / legacy logging; no longer used for masking.
         self.ankle_idx = [4, 5, 10, 11]
 
-        self.n_mimic_obs = 35  # 6 + 29 (modified: root_vel_xy + root_pos_z + roll_pitch + yaw_ang_vel + dof_pos)
-        self.n_proprio = 3 + 2 + 3*29    # from config analysis
-        self.n_obs_single = 35 + 3 + 2 + 3*29  # n_mimic_obs + n_proprio = 35 + 92 = 127
+        # ------------------------------------------------------------------
+        # Observation layout -- matches DEX_RL_LAB PolicyCfg (term-major).
+        # ------------------------------------------------------------------
+        # IsaacLab ObservationManager flattens each ObsTerm's CircularBuffer as
+        # [oldest, ..., newest] and concatenates terms in declaration order.
+        # PolicyCfg order (see g1_29dof_sonic_distill.py):
+        #   base_ang_vel              (3, history=10, scale 0.25)
+        #   base_roll_pitch           (2, history=10)
+        #   joint_pos_rel             (29, history=10, Isaac order)
+        #   joint_vel_rel             (29, history=10, Isaac order, ankle mask, scale 0.05)
+        #   last_action               (29, history=10, Isaac order)
+        #   future_motion_mimic_target(35, history=1)
+        #
+        # Final flat dim = 10*(3+2+29+29+29) + 35 = 920 + 35 = 955.
+        #
+        # NOTE: PolicyCfg may also contain ``diff_body_pos_b_deploy``. It is NOT
+        # reproduced here (deploy has no robot/reference body FK). If training
+        # keeps it, this obs will be short by that term's width — either remove
+        # the term from training, or implement the FK diff here.
         self.history_len = 10
-        
-        self.total_obs_size = self.n_obs_single * (self.history_len + 1) + self.n_mimic_obs   # 127*11 + 35 = 1402
+        self._hist_dims = {
+            "base_ang_vel":     3,
+            "base_roll_pitch":  2,
+            "joint_pos_rel":   29,
+            "joint_vel_rel":   29,
+            "last_action":     29,
+        }
+        self._hist_term_order = [
+            "base_ang_vel", "base_roll_pitch",
+            "joint_pos_rel", "joint_vel_rel", "last_action",
+        ]
 
-        print(f"TWIST2 Controller Configuration:")
-        print(f"  n_mimic_obs: {self.n_mimic_obs}")
-        print(f"  n_proprio: {self.n_proprio}")
-        print(f"  n_obs_single: {self.n_obs_single}")
-        print(f"  history_len: {self.history_len}")
+        self._mimic_dim = 0 # 35   # TODO: should be removed
+
+        self.total_obs_size = (
+            self.history_len * sum(self._hist_dims.values()) + self._mimic_dim
+        )
+
+        print(f"TWIST2 Controller Configuration (term-major, DEX_RL_LAB layout):")
+        for name in self._hist_term_order:
+            d = self._hist_dims[name]
+            print(f"  {name}: history={self.history_len} x dim={d} = {self.history_len * d}")
+        print(f"  future_motion_mimic_target (no history): {self._mimic_dim}")
         print(f"  total_obs_size: {self.total_obs_size}")
 
-        # Initialize history buffer
-        self.proprio_history_buf = deque(maxlen=self.history_len)
-        for _ in range(self.history_len):
-            self.proprio_history_buf.append(np.zeros(self.n_obs_single, dtype=np.float32))
+        # One ring buffer per term. IsaacLab CircularBuffer, on first push,
+        # back-fills every slot with that first observation; we replicate that
+        # by initializing each deque with zeros and then relying on the first
+        # step to fill them (the behaviour difference at step 0 is negligible).
+        self._hist_bufs = {
+            name: deque(
+                [np.zeros(d, dtype=np.float32) for _ in range(self.history_len)],
+                maxlen=self.history_len,
+            )
+            for name, d in self._hist_dims.items()
+        }
 
         # Recording
         self.record_video = record_video
@@ -217,9 +316,11 @@ class RealTimePolicyController:
         steps = int(self.sim_duration / self.sim_dt)
         pbar = tqdm(range(steps), desc="Simulating TWIST2...")
 
-        # Send initial proprio to redis
-        initial_obs = np.zeros(self.n_obs_single, dtype=np.float32)
-        self.redis_pipeline.set("state_body_unitree_g1_with_hands", json.dumps(initial_obs.tolist()))
+        # Send initial proprio to redis -- state_body has shape 3+2+29 = 34
+        # (same layout the main loop will publish, just zero-filled so the teleop
+        # bridge has something to read on its first tick).
+        initial_state_body = np.zeros(3 + 2 + self.num_actions, dtype=np.float32)
+        self.redis_pipeline.set("state_body_unitree_g1_with_hands", json.dumps(initial_state_body.tolist()))
         self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
         self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
         self.redis_pipeline.execute()
@@ -241,60 +342,73 @@ class RealTimePolicyController:
                 dof_pos, dof_vel, quat, ang_vel, sim_torque = self.extract_data()
                 
                 if i % self.sim_decimation == 0:
-                    # Build proprioceptive observation
+                    # ---- 1) Compute the current-frame value of each ObsTerm ----
+                    # dof_pos / dof_vel come out of MuJoCo in SDK order; the policy
+                    # expects Isaac order, so we permute before feeding them in.
+                    # last_action is already stored in Isaac order (raw policy output).
                     rpy = quatToEuler(quat)
-                    obs_body_dof_vel = dof_vel.copy()
-                    obs_body_dof_vel[self.ankle_idx] = 0.
-                    obs_proprio = np.concatenate([
-                        ang_vel * 0.25,
-                        rpy[:2], # only use roll and pitch
-                        (dof_pos - self.default_dof_pos),
-                        obs_body_dof_vel * 0.05,
-                        self.last_action
-                    ])
+                    dof_pos_isaac = dof_pos[self.sdk_to_isaac]
+                    dof_vel_isaac = dof_vel[self.sdk_to_isaac].copy()
+                    dof_vel_isaac[self.ankle_idx_isaac] = 0.0
 
+                    term_current = {
+                        "base_ang_vel":    (ang_vel * 0.25).astype(np.float32),
+                        "base_roll_pitch": rpy[:2].astype(np.float32),
+                        "joint_pos_rel":   (dof_pos_isaac - self.default_dof_pos_isaac).astype(np.float32),
+                        "joint_vel_rel":   (dof_vel_isaac * 0.05).astype(np.float32),
+                        "last_action":     self.last_action.astype(np.float32),
+                    }
+
+                    # ---- 2) Redis: publish state_body, pull action_mimic ----
+                    # state_body (teleop bridge input) stays in MuJoCo/SDK order.
                     state_body = np.concatenate([
                         ang_vel,
                         rpy[:2],
                         dof_pos]) # 3+2+29 = 34 dims
 
-                    # Send proprio to redis
-                    
                     self.redis_pipeline.set("state_body_unitree_g1_with_hands", json.dumps(state_body.tolist()))
                     self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
                     self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
                     self.redis_pipeline.set("state_neck_unitree_g1_with_hands", json.dumps(np.zeros(2).tolist()))
-                    self.redis_pipeline.set("t_state", int(time.time() * 1000)) # current timestamp in ms
+                    self.redis_pipeline.set("t_state", int(time.time() * 1000))
                     self.redis_pipeline.execute()
 
-                    # Get mimic obs from Redis
                     keys = ["action_body_unitree_g1_with_hands", "action_hand_left_unitree_g1_with_hands", "action_hand_right_unitree_g1_with_hands", "action_neck_unitree_g1_with_hands"]
                     for key in keys:
                         self.redis_pipeline.get(key)
                     redis_results = self.redis_pipeline.execute()
-                    action_mimic = json.loads(redis_results[0])
+                    action_mimic = np.asarray(json.loads(redis_results[0]), dtype=np.float32)
                     action_left_hand = json.loads(redis_results[1])
                     action_right_hand = json.loads(redis_results[2])
                     action_neck = json.loads(redis_results[3])
 
-                    # Construct observation for TWIST2 controller
-                    obs_full = np.concatenate([action_mimic, obs_proprio])
-                    # Update history
-                    obs_hist = np.array(self.proprio_history_buf).flatten()
-                    self.proprio_history_buf.append(obs_full)
-                    future_obs = action_mimic.copy()
-                    # Combine all observations: current + history + future (set to current frame for now)
-                    obs_buf = np.concatenate([obs_full, obs_hist, future_obs])
-                    
+                    # assert action_mimic.shape[0] == self._mimic_dim, \
+                    #     f"Expected mimic dim {self._mimic_dim}, got {action_mimic.shape[0]}"
 
-                    # Ensure correct total observation size
-                    assert obs_buf.shape[0] == self.total_obs_size, f"Expected {self.total_obs_size} obs, got {obs_buf.shape[0]}"
+                    # ---- 3) Append current values into per-term ring buffers ----
+                    for name in self._hist_term_order:
+                        self._hist_bufs[name].append(term_current[name])
+
+                    # ---- 4) Build the flat obs tensor in training term-major order ----
+                    # Each term: CircularBuffer flattened as [oldest, ..., newest].
+                    # Final layout: concat over terms, then append current mimic target.
+                    flat_parts = [
+                        np.asarray(self._hist_bufs[name], dtype=np.float32).reshape(-1)
+                        for name in self._hist_term_order
+                    ]
+                    
+                    # flat_parts.append(action_mimic) # TODO: should be removed
+
+                    obs_buf = np.concatenate(flat_parts)
+
+                    assert obs_buf.shape[0] == self.total_obs_size, \
+                        f"Expected {self.total_obs_size} obs, got {obs_buf.shape[0]}"
                     
                     # Run policy
                     obs_tensor = torch.from_numpy(obs_buf).float().unsqueeze(0).to(self.device)
                     with torch.no_grad():
                         raw_action = self.policy(obs_tensor).cpu().numpy().squeeze()
-                    
+
                     # Measure and track policy execution FPS
                     current_time = time.time()
                     if last_policy_time is not None:
@@ -334,10 +448,13 @@ class RealTimePolicyController:
                                 fps_iteration_count = 0
                     last_policy_time = current_time
                     
+                    # raw_action is in Isaac joint order (policy output).
                     self.last_action = raw_action
                     raw_action = np.clip(raw_action, -10., 10.)
-                    scaled_actions = raw_action * self.action_scale
-                    pd_target = scaled_actions + self.default_dof_pos
+                    scaled_actions_isaac = raw_action * self.action_scale
+                    pd_target_isaac = scaled_actions_isaac + self.default_dof_pos_isaac
+                    # Back to MuJoCo/SDK order before applying PD on data.ctrl.
+                    pd_target = pd_target_isaac[self.isaac_to_sdk]
 
                     # self.redis_client.set("action_low_level_unitree_g1", json.dumps(raw_action.tolist()))
                     
@@ -366,7 +483,7 @@ class RealTimePolicyController:
                 # PD control
                 torque = (pd_target - dof_pos) * self.stiffness - dof_vel * self.damping
                 torque = np.clip(torque, -self.torque_limits, self.torque_limits)
-                
+
                 self.data.ctrl[:] = torque
                 mujoco.mj_step(self.model, self.data)
                 
