@@ -35,7 +35,7 @@ def build_mimic_obs(
     obs_motion_times = obs_motion_times.flatten()
     
     # Suppose we only have a single motion in the .pkl
-    motion_ids = torch.zeros(len(tar_motion_steps), dtype=torch.int, device=device)
+    motion_ids = torch.zeros(len(tar_motion_steps), dtype=torch.long, device=device)
     
     # Retrieve motion frames
     root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel, local_key_body_pos, root_pos_delta_local, root_rot_delta_local = motion_lib.calc_motion_frame(motion_ids, obs_motion_times)
@@ -125,7 +125,7 @@ def main(args, xml_file, robot_base):
     
     # 3. Prepare the steps array
     tar_motion_steps = [int(x.strip()) for x in args.steps.split(",")]
-    tar_motion_steps_tensor = torch.tensor(tar_motion_steps, device=device, dtype=torch.int)
+    tar_motion_steps_tensor = torch.tensor(tar_motion_steps, device=device, dtype=torch.long)
 
     # 4. Loop over time steps and publish mimic obs
     control_dt = 0.02
