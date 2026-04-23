@@ -57,15 +57,42 @@ def load_onnx_policy(policy_path: str, device: str) -> OnnxPolicyWrapper:
 
 
 class RealTimePolicyController:
-    def __init__(self, 
-                 xml_file, 
-                 policy_path, 
-                 device='cuda', 
+    # Mirrors DEX_RL_LAB TRACKED_BODY_NAMES (29) for g1_29dof_sonic_distill.
+    # Order must match so the deployed policy sees the same body indexing the
+    # teacher/student were trained on.
+    TRACKED_BODY_NAMES = [
+        "pelvis",
+        "left_hip_pitch_link", "left_hip_roll_link", "left_hip_yaw_link",
+        "left_knee_link", "left_ankle_pitch_link", "left_ankle_roll_link",
+        "right_hip_pitch_link", "right_hip_roll_link", "right_hip_yaw_link",
+        "right_knee_link", "right_ankle_pitch_link", "right_ankle_roll_link",
+        "waist_yaw_link", "waist_roll_link", "torso_link",
+        "left_shoulder_pitch_link", "left_shoulder_roll_link",
+        "left_shoulder_yaw_link", "left_elbow_link",
+        "left_wrist_roll_link", "left_wrist_pitch_link", "left_wrist_yaw_link",
+        "right_shoulder_pitch_link", "right_shoulder_roll_link",
+        "right_shoulder_yaw_link", "right_elbow_link",
+        "right_wrist_roll_link", "right_wrist_pitch_link", "right_wrist_yaw_link",
+    ]
+    # Matches SMPLCfg.extending.extended_joints in DEX_RL_LAB (g1_29dof_smpl_cfg.py):
+    # (name, parent_body, local_offset) -- local_offset is in parent-body frame.
+    EXTENDED_JOINTS = [
+        ("left_hand_link_ext",  "left_wrist_yaw_link",  (0.0415,  0.003, 0.0)),
+        ("right_hand_link_ext", "right_wrist_yaw_link", (0.0415, -0.003, 0.0)),
+        ("head_link_ext",       "torso_link",           (0.0,     0.0,   0.4)),
+    ]
+    NUM_TRACKED_BODIES = 30 + 3  # 33
+
+    def __init__(self,
+                 xml_file,
+                 policy_path,
+                 device='cuda',
                  record_video=False,
                  record_proprio=False,
                  measure_fps=False,
                  limit_fps=True,
                  policy_frequency=50,
+                 use_diff_body_pos=False,
                  ):
         self.measure_fps = measure_fps
         self.limit_fps = limit_fps
@@ -251,8 +278,46 @@ class RealTimePolicyController:
 
         self._mimic_dim = 35   # TODO: MOTION_OBS
 
+        # diff_body_pos_b observation (ref-robot per-body position diff in robot base
+        # frame). Assumes the motion server publishes root+heading-aligned mimic_obs,
+        # so the ref root is reconstructible from (z, roll, pitch, dof_pos) alone.
+        # In PolicyCfg it has history_length=10 and is declared AFTER
+        # future_motion_mimic_target, so it's appended post-mimic in flat_parts.
+        self.use_diff_body_pos = use_diff_body_pos
+        self._diff_body_pos_per_step = self.NUM_TRACKED_BODIES * 3  # 99
+        self._diff_body_pos_total = (
+            self.history_len * self._diff_body_pos_per_step if use_diff_body_pos else 0
+        )
+
         self.total_obs_size = (
-            self.history_len * sum(self._hist_dims.values()) + self._mimic_dim
+            self.history_len * sum(self._hist_dims.values())
+            + self._mimic_dim
+            + self._diff_body_pos_total
+        )
+
+        # Body-layout caches used when use_diff_body_pos is on (built here so we
+        # can also print their dims below).
+        self.tracked_body_ids = np.array(
+            [self.model.body(n).id for n in self.TRACKED_BODY_NAMES], dtype=np.int64
+        )
+        self.extended_parent_ids = np.array(
+            [self.model.body(parent).id for _, parent, _ in self.EXTENDED_JOINTS],
+            dtype=np.int64,
+        )
+        self.extended_local_offsets = np.array(
+            [offset for _, _, offset in self.EXTENDED_JOINTS], dtype=np.float64
+        )
+        # Secondary MjData for running FK on the reference motion frame each step.
+        self.ref_data = mujoco.MjData(self.model) if use_diff_body_pos else None
+
+        # diff_body_pos_b has its own history buffer (history=10, separate from
+        # _hist_bufs because it's emitted *after* action_mimic in the obs layout).
+        self._diff_body_pos_hist = (
+            deque(
+                [np.zeros(self._diff_body_pos_per_step, dtype=np.float32) for _ in range(self.history_len)],
+                maxlen=self.history_len,
+            )
+            if use_diff_body_pos else None
         )
 
         print(f"TWIST2 Controller Configuration (term-major, DEX_RL_LAB layout):")
@@ -260,6 +325,8 @@ class RealTimePolicyController:
             d = self._hist_dims[name]
             print(f"  {name}: history={self.history_len} x dim={d} = {self.history_len * d}")
         print(f"  future_motion_mimic_target (no history): {self._mimic_dim}")
+        if use_diff_body_pos:
+            print(f"  diff_body_pos_b: history={self.history_len} x dim={self._diff_body_pos_per_step} = {self._diff_body_pos_total}")
         print(f"  total_obs_size: {self.total_obs_size}")
 
         # One ring buffer per term. IsaacLab CircularBuffer, on first push,
@@ -300,6 +367,63 @@ class RealTimePolicyController:
         ang_vel = self.data.qvel[3:6]
         sim_torque = self.data.ctrl
         return dof_pos, dof_vel, quat, ang_vel, sim_torque
+
+    def _compute_extended_body_pos_w(self, data):
+        """Stack world positions for the 29 tracked bodies + 3 extended joints.
+
+        Returns [32, 3] in TRACKED_BODY_NAMES order followed by EXTENDED_JOINTS order.
+        Extended joints are computed as ``parent_xpos + parent_R @ local_offset``.
+        """
+        tracked_pos = data.xpos[self.tracked_body_ids]
+        parent_pos = data.xpos[self.extended_parent_ids]
+        parent_mat = data.xmat[self.extended_parent_ids].reshape(-1, 3, 3)
+        ext_pos = parent_pos + np.einsum("bij,bj->bi", parent_mat, self.extended_local_offsets)
+        return np.concatenate([tracked_pos, ext_pos], axis=0)
+
+    def _compute_diff_body_pos_b(self, action_mimic):
+        """Compute diff_body_pos_b (matches DEX_RL_LAB mdp.diff_body_pos_b under
+        root+heading alignment) as a flat [NUM_TRACKED_BODIES * 3] float32 array.
+
+        ``action_mimic`` layout (motion server ``build_mimic_obs``):
+            [xy_vel_local(2), z(1), roll(1), pitch(1), yaw_ang_vel_local(1), dof_pos(29)]
+        Under fix_root_pos + fix_root_heading the ref root xy and yaw are both 0,
+        so (z, roll, pitch, dof_pos) fully determines the ref pose for FK.
+        """
+        ref_z = float(action_mimic[2])
+        ref_roll = float(action_mimic[3])
+        ref_pitch = float(action_mimic[4])
+        ref_dof_pos = np.asarray(action_mimic[-self.num_actions:], dtype=np.float64)
+
+        # Build ref root quat (w, x, y, z) from roll/pitch/yaw=0.
+        hr, hp = 0.5 * ref_roll, 0.5 * ref_pitch
+        cr, sr = np.cos(hr), np.sin(hr)
+        cp, sp = np.cos(hp), np.sin(hp)
+        ref_qw = cr * cp
+        ref_qx = sr * cp
+        ref_qy = cr * sp
+        ref_qz = -sr * sp
+
+        self.ref_data.qpos[:3] = (0.0, 0.0, ref_z)
+        self.ref_data.qpos[3:7] = (ref_qw, ref_qx, ref_qy, ref_qz)
+        self.ref_data.qpos[7:7 + self.num_actions] = ref_dof_pos
+        mujoco.mj_kinematics(self.model, self.ref_data)
+
+        ref_body_pos_w = self._compute_extended_body_pos_w(self.ref_data)      # [N, 3]
+        robot_body_pos_w = self._compute_extended_body_pos_w(self.data)        # [N, 3]
+
+        # Subtract each side's own root (pelvis == index 0) before diffing so any
+        # residual root xy/z offset between sim and ref is cancelled -- matches
+        # diff_body_pos_b_deploy, which collapses to diff_body_pos_b under alignment.
+        ref_body_rel = ref_body_pos_w - ref_body_pos_w[0:1]
+        robot_body_rel = robot_body_pos_w - robot_body_pos_w[0:1]
+        diff_w = ref_body_rel - robot_body_rel                                  # [N, 3]
+
+        # Rotate world-frame diff into robot base (pelvis) frame.
+        # xmat[pelvis] maps body->world, so (R.T @ v_w) == v_b, i.e. v_b = v_w @ R.
+        pelvis_id = int(self.tracked_body_ids[0])
+        R_body_to_world = self.data.xmat[pelvis_id].reshape(3, 3)
+        diff_b = diff_w @ R_body_to_world
+        return diff_b.astype(np.float32).reshape(-1)
 
     def run(self):
         """Main simulation loop"""
@@ -408,6 +532,13 @@ class RealTimePolicyController:
                     ]
                     
                     flat_parts.append(action_mimic)   # TODO: MOTION_OBS
+
+                    if self.use_diff_body_pos:
+                        diff_body_pos_b = self._compute_diff_body_pos_b(action_mimic)
+                        self._diff_body_pos_hist.append(diff_body_pos_b)
+                        flat_parts.append(
+                            np.asarray(self._diff_body_pos_hist, dtype=np.float32).reshape(-1)
+                        )
 
                     obs_buf = np.concatenate(flat_parts)
 
@@ -541,6 +672,9 @@ def main():
     parser.add_argument("--measure_fps", help="Measure FPS", default=0, type=int)
     parser.add_argument("--limit_fps", help="Limit FPS with sleep", default=1, type=int)
     parser.add_argument("--policy_frequency", help="Policy frequency", default=100, type=int)
+    parser.add_argument("--use_diff_body_pos", action="store_true",
+                        help="Append diff_body_pos_b observation (32 bodies * 3 = 96 dims) "
+                             "to the obs. Assumes motion server publishes root+heading-aligned mimic_obs.")
     args = parser.parse_args()
     
     # Verify policy file exists
@@ -570,6 +704,7 @@ def main():
         measure_fps=args.measure_fps,
         limit_fps=args.limit_fps,
         policy_frequency=args.policy_frequency,
+        use_diff_body_pos=args.use_diff_body_pos,
     )
     controller.run()
 

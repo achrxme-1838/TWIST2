@@ -6,7 +6,6 @@ script_dir=$(dirname $(realpath $0))
 motion_file="${script_dir}/assets/example_motions/A6_lift_box_poses.pkl"
 # motion_file="${script_dir}/assets/example_motions/B3-walk1_poses.pkl"
 
-
 # Change to deploy_real directory
 cd deploy_real
 
