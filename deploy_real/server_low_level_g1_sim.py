@@ -93,6 +93,7 @@ class RealTimePolicyController:
                  limit_fps=True,
                  policy_frequency=50,
                  use_diff_body_pos=False,
+                 use_diff_body_tannorm=False,
                  ):
         self.measure_fps = measure_fps
         self.limit_fps = limit_fps
@@ -289,10 +290,20 @@ class RealTimePolicyController:
             self.history_len * self._diff_body_pos_per_step if use_diff_body_pos else 0
         )
 
+        # diff_body_tannorm_pb: per-body 6D tan-norm of the ref/robot rotation diff
+        # in robot planar (yaw-only) base frame. Declared AFTER diff_body_pos_b in
+        # PolicyCfg so it's appended last in flat_parts.
+        self.use_diff_body_tannorm = use_diff_body_tannorm
+        self._diff_body_tannorm_per_step = self.NUM_TRACKED_BODIES * 6  # 198
+        self._diff_body_tannorm_total = (
+            self.history_len * self._diff_body_tannorm_per_step if use_diff_body_tannorm else 0
+        )
+
         self.total_obs_size = (
             self.history_len * sum(self._hist_dims.values())
             + self._mimic_dim
             + self._diff_body_pos_total
+            + self._diff_body_tannorm_total
         )
 
         # Body-layout caches used when use_diff_body_pos is on (built here so we
@@ -308,7 +319,11 @@ class RealTimePolicyController:
             [offset for _, _, offset in self.EXTENDED_JOINTS], dtype=np.float64
         )
         # Secondary MjData for running FK on the reference motion frame each step.
-        self.ref_data = mujoco.MjData(self.model) if use_diff_body_pos else None
+        # Shared between diff_body_pos_b and diff_body_tannorm_pb when both are on.
+        self.ref_data = (
+            mujoco.MjData(self.model)
+            if (use_diff_body_pos or use_diff_body_tannorm) else None
+        )
 
         # diff_body_pos_b has its own history buffer (history=10, separate from
         # _hist_bufs because it's emitted *after* action_mimic in the obs layout).
@@ -319,6 +334,13 @@ class RealTimePolicyController:
             )
             if use_diff_body_pos else None
         )
+        self._diff_body_tannorm_hist = (
+            deque(
+                [np.zeros(self._diff_body_tannorm_per_step, dtype=np.float32) for _ in range(self.history_len)],
+                maxlen=self.history_len,
+            )
+            if use_diff_body_tannorm else None
+        )
 
         print(f"TWIST2 Controller Configuration (term-major, DEX_RL_LAB layout):")
         for name in self._hist_term_order:
@@ -327,6 +349,8 @@ class RealTimePolicyController:
         print(f"  future_motion_mimic_target (no history): {self._mimic_dim}")
         if use_diff_body_pos:
             print(f"  diff_body_pos_b: history={self.history_len} x dim={self._diff_body_pos_per_step} = {self._diff_body_pos_total}")
+        if use_diff_body_tannorm:
+            print(f"  diff_body_tannorm_pb: history={self.history_len} x dim={self._diff_body_tannorm_per_step} = {self._diff_body_tannorm_total}")
         print(f"  total_obs_size: {self.total_obs_size}")
 
         # One ring buffer per term. IsaacLab CircularBuffer, on first push,
@@ -424,6 +448,108 @@ class RealTimePolicyController:
         R_body_to_world = self.data.xmat[pelvis_id].reshape(3, 3)
         diff_b = diff_w @ R_body_to_world
         return diff_b.astype(np.float32).reshape(-1)
+
+    def _compute_extended_body_quat_w(self, data):
+        """Stack world quats for the 30 tracked bodies + 3 extended joints.
+
+        Extended bodies inherit their parent body's world orientation (matches
+        ``extending_body_quat_w`` in DEX_RL_LAB). Returns [33, 4] in
+        TRACKED_BODY_NAMES order followed by EXTENDED_JOINTS parent-order, with
+        (w, x, y, z) convention (MuJoCo's ``data.xquat``).
+        """
+        tracked_quat = data.xquat[self.tracked_body_ids]       # [30, 4]
+        parent_quat = data.xquat[self.extended_parent_ids]     # [3, 4]
+        return np.concatenate([tracked_quat, parent_quat], axis=0)
+
+    @staticmethod
+    def _quat_mul_np(q1, q2):
+        w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+        w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+        w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+        x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+        y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+        z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+        return np.stack([w, x, y, z], axis=-1)
+
+    @staticmethod
+    def _quat_conj_np(q):
+        out = q.copy()
+        out[..., 1:] *= -1.0
+        return out
+
+    @staticmethod
+    def _quat_apply_np(q, v):
+        qw = q[..., 0:1]
+        qxyz = q[..., 1:4]
+        t = 2.0 * np.cross(qxyz, v)
+        return v + qw * t + np.cross(qxyz, t)
+
+    def _compute_diff_body_tannorm_pb(self, action_mimic):
+        """Compute diff_body_tannorm_pb (matches DEX_RL_LAB mdp.diff_body_tannorm_pb
+        under root+heading alignment) as flat [NUM_TRACKED_BODIES * 6] float32.
+
+        Under fix_root_pos + fix_root_heading, the ref root xy and yaw are both 0,
+        so (z, roll, pitch, dof_pos) from action_mimic fully determines the ref
+        pose for FK -- same assumption as ``_compute_diff_body_pos_b``.
+
+        Math:
+            diff_q_w  = q_ref_w * conj(q_robot_w)             per body
+            diff_q_pb = conj(q_yaw) * diff_q_w * q_yaw        (robot root yaw-only)
+            tannorm   = [ diff_q_pb * (1,0,0), diff_q_pb * (0,0,1) ]   (6D per body)
+        """
+        ref_z = float(action_mimic[2])
+        ref_roll = float(action_mimic[3])
+        ref_pitch = float(action_mimic[4])
+        ref_dof_pos = np.asarray(action_mimic[-self.num_actions:], dtype=np.float64)
+
+        hr, hp = 0.5 * ref_roll, 0.5 * ref_pitch
+        cr, sr = np.cos(hr), np.sin(hr)
+        cp, sp = np.cos(hp), np.sin(hp)
+        ref_qw = cr * cp
+        ref_qx = sr * cp
+        ref_qy = cr * sp
+        ref_qz = -sr * sp
+
+        self.ref_data.qpos[:3] = (0.0, 0.0, ref_z)
+        self.ref_data.qpos[3:7] = (ref_qw, ref_qx, ref_qy, ref_qz)
+        self.ref_data.qpos[7:7 + self.num_actions] = ref_dof_pos
+        mujoco.mj_kinematics(self.model, self.ref_data)
+
+        ref_body_quat_w = self._compute_extended_body_quat_w(self.ref_data)     # [N, 4]
+        robot_body_quat_w = self._compute_extended_body_quat_w(self.data)       # [N, 4]
+
+        diff_body_quat_w = self._quat_mul_np(
+            ref_body_quat_w,
+            self._quat_conj_np(robot_body_quat_w),
+        )
+
+        # Robot planar (yaw-only) root quat, broadcast across bodies.
+        # yaw is the x-axis heading -- same convention as calc_heading in DEX_RL_LAB.
+        w, x, y, z = (float(v) for v in self.data.qpos[3:7])
+        dir_x = 1.0 - 2.0 * (y * y + z * z)
+        dir_y = 2.0 * (w * z + x * y)
+        yaw_half = 0.5 * np.arctan2(dir_y, dir_x)
+        planar_root_quat = np.array(
+            [np.cos(yaw_half), 0.0, 0.0, np.sin(yaw_half)], dtype=np.float64
+        )
+        inv_planar_root_quat = self._quat_conj_np(planar_root_quat)
+
+        planar_b = np.broadcast_to(planar_root_quat, diff_body_quat_w.shape)
+        inv_planar_b = np.broadcast_to(inv_planar_root_quat, diff_body_quat_w.shape)
+
+        diff_body_quat_pb = self._quat_mul_np(
+            self._quat_mul_np(inv_planar_b, diff_body_quat_w),
+            planar_b,
+        )
+
+        # Tan-norm: rotate reference tangent (1,0,0) and normal (0,0,1) by each
+        # diff quat and concatenate -> 6D per body.
+        ref_tan = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        ref_norm = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        tan = self._quat_apply_np(diff_body_quat_pb, ref_tan)    # [N, 3]
+        norm = self._quat_apply_np(diff_body_quat_pb, ref_norm)  # [N, 3]
+        tannorm = np.concatenate([tan, norm], axis=-1)           # [N, 6]
+        return tannorm.astype(np.float32).reshape(-1)
 
     def run(self):
         """Main simulation loop"""
@@ -538,6 +664,13 @@ class RealTimePolicyController:
                         self._diff_body_pos_hist.append(diff_body_pos_b)
                         flat_parts.append(
                             np.asarray(self._diff_body_pos_hist, dtype=np.float32).reshape(-1)
+                        )
+
+                    if self.use_diff_body_tannorm:
+                        diff_body_tannorm_pb = self._compute_diff_body_tannorm_pb(action_mimic)
+                        self._diff_body_tannorm_hist.append(diff_body_tannorm_pb)
+                        flat_parts.append(
+                            np.asarray(self._diff_body_tannorm_hist, dtype=np.float32).reshape(-1)
                         )
 
                     obs_buf = np.concatenate(flat_parts)
@@ -675,6 +808,9 @@ def main():
     parser.add_argument("--use_diff_body_pos", action="store_true",
                         help="Append diff_body_pos_b observation (32 bodies * 3 = 96 dims) "
                              "to the obs. Assumes motion server publishes root+heading-aligned mimic_obs.")
+    parser.add_argument("--use_diff_body_tannorm", action="store_true",
+                        help="Append diff_body_tannorm_pb observation (33 bodies * 6 = 198 dims) "
+                             "to the obs. Assumes motion server publishes root+heading-aligned mimic_obs.")
     args = parser.parse_args()
     
     # Verify policy file exists
@@ -705,6 +841,7 @@ def main():
         limit_fps=args.limit_fps,
         policy_frequency=args.policy_frequency,
         use_diff_body_pos=args.use_diff_body_pos,
+        use_diff_body_tannorm=args.use_diff_body_tannorm,
     )
     controller.run()
 

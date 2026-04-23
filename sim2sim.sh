@@ -16,7 +16,9 @@ python server_low_level_g1_sim.py \
     --measure_fps 1 \
     --policy_frequency 50 \
     --limit_fps 1 \
-    --use_diff_body_pos
-    
+    --use_diff_body_pos \
+    --use_diff_body_tannorm
+
+
     # --policy_frequency 100 \
     # --record_proprio \
