@@ -1,10 +1,11 @@
 import numpy as np
 
 DEFAULT_MIMIC_OBS_G1 = np.concatenate([
-                    np.array([0, 0]), # xy velocity
+                    np.array([0, 0]), # xy velocity (root-local)
                     np.array([0.8]), # z position
                     np.array([0, 0]), # roll/pitch
-                    np.array([0]), # yaw angular velocity
+                    np.array([0]), # yaw (in robot's start-heading frame)
+                    np.array([0, 0, 0]), # full angular velocity (root-local)
                     # 29 dof
                     np.array([-0.2, 0.0, 0.0, 0.4, -0.2, 0.0,  # left leg (6)
                             -0.2, 0.0, 0.0, 0.4, -0.2, 0.0,  # right leg (6)
@@ -15,10 +16,11 @@ DEFAULT_MIMIC_OBS_G1 = np.concatenate([
                 ])
 
 DEFAULT_MIMIC_OBS_G1_MIXED_MODE = np.concatenate([
-                    np.array([0, 0]), # xy velocity
+                    np.array([0, 0]), # xy velocity (root-local)
                     np.array([0.8]), # z position
                     np.array([0, 0]), # roll/pitch
-                    np.array([0]), # yaw angular velocity
+                    np.array([0]), # yaw (in robot's start-heading frame)
+                    np.array([0, 0, 0]), # full angular velocity (root-local)
                     # 29 dof
                     np.array([-0.2, 0.0, 0.0, 0.4, -0.2, 0.0,  # left leg (6)
                             -0.2, 0.0, 0.0, 0.4, -0.2, 0.0,  # right leg (6)

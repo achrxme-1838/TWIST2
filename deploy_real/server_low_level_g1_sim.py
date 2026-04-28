@@ -256,9 +256,9 @@ class RealTimePolicyController:
         #   joint_pos_rel             (29, history=10, Isaac order)
         #   joint_vel_rel             (29, history=10, Isaac order, ankle mask, scale 0.05)
         #   last_action               (29, history=10, Isaac order)
-        #   future_motion_mimic_target(35, history=1)
+        #   upcoming_twist_mimic_target(38, history=1)
         #
-        # Final flat dim = 10*(3+2+29+29+29) + 35 = 920 + 35 = 955.
+        # Final flat dim = 10*(3+2+29+29+29) + 38 = 920 + 38 = 958.
         #
         # NOTE: PolicyCfg may also contain ``diff_body_pos_b_deploy``. It is NOT
         # reproduced here (deploy has no robot/reference body FK). If training
@@ -277,15 +277,20 @@ class RealTimePolicyController:
             "joint_pos_rel", "joint_vel_rel", "last_action",
         ]
 
-        self._mimic_dim = 35   # TODO: MOTION_OBS
+        # mimic_obs (action_body) layout (motion_server build_mimic_obs):
+        #   [xy_vel_local(2), z(1), roll(1), pitch(1), yaw(1), ang_vel_local(3), dof_pos(29)]
+        # = 38 dims. yaw is the ref root yaw in the published frame; motion_server
+        # anchors motion frame 0's yaw to robot's heading at playback start so
+        # this yaw is comparable to the robot's actual yaw in the same world frame.
+        self._mimic_dim = 38
 
         # diff_body_pos_b observation (ref-robot per-body position diff in robot base
-        # frame). The motion server's mimic_obs carries (z, roll, pitch, dof_pos)
-        # but no absolute yaw, so the ref root yaw is reconstructed at FK time
-        # from the robot's current planar yaw — this keeps ref/robot in the same
-        # heading frame regardless of whether motion_server heading-aligns.
+        # frame). Ref FK uses (z, roll, pitch, yaw, dof_pos) from mimic_obs --
+        # since motion_server publishes ref yaw in the same frame as the robot's
+        # heading (anchored at start), we no longer need to substitute the robot's
+        # current yaw and yaw mismatches now show up in the diff.
         # In PolicyCfg it has history_length=10 and is declared AFTER
-        # future_motion_mimic_target, so it's appended post-mimic in flat_parts.
+        # upcoming_twist_mimic_target, so it's appended post-mimic in flat_parts.
         self.use_diff_body_pos = use_diff_body_pos
         self._diff_body_pos_per_step = self.NUM_TRACKED_BODIES * 3  # 99
         self._diff_body_pos_total = (
@@ -407,16 +412,18 @@ class RealTimePolicyController:
         return np.concatenate([tracked_pos, ext_pos], axis=0)
 
     def _compute_diff_body_pos_b(self, action_mimic, use_pb=False):
-        """Compute diff_body_pos_b/pb (matches DEX_RL_LAB mdp.diff_body_pos_b
-        under root xy alignment) as a flat [NUM_TRACKED_BODIES * 3] float32
-        array.
+        """Compute diff_body_pos_b/pb (matches DEX_RL_LAB mdp.diff_body_pos_pb
+        under root xy alignment + motion-start heading anchor) as a flat
+        [NUM_TRACKED_BODIES * 3] float32 array.
 
-        ``action_mimic`` layout (motion server ``build_mimic_obs``):
-            [xy_vel_local(2), z(1), roll(1), pitch(1), yaw_ang_vel_local(1), dof_pos(29)]
-        mimic_obs has no absolute yaw, so we use the robot's current planar yaw
-        when constructing the ref root quat — this keeps ref/robot in the same
-        heading frame regardless of whether motion_server heading-aligns. The
-        ref root xy is left at 0 (per-side root subtraction below cancels it).
+        ``action_mimic`` layout (motion server ``build_mimic_obs``, 36-dim):
+            [xy_vel_local(2), z(1), roll(1), pitch(1), yaw(1),
+             yaw_ang_vel_local(1), dof_pos(29)]
+        ref yaw is read directly from mimic_obs[5] -- motion_server anchors
+        motion frame 0's yaw to robot's heading at playback start, so the ref
+        yaw is in the same world frame as the robot's actual yaw and yaw
+        mismatches show up in the diff. Ref root xy stays at 0 (per-side root
+        subtraction below cancels it).
 
         If ``use_pb=True``, rotates the world-frame diff into the robot *planar*
         (yaw-only) base frame -- matches DEX_RL_LAB mdp.diff_body_pos_pb /
@@ -425,17 +432,12 @@ class RealTimePolicyController:
         ref_z = float(action_mimic[2])
         ref_roll = float(action_mimic[3])
         ref_pitch = float(action_mimic[4])
+        ref_yaw = float(action_mimic[5])
         ref_dof_pos = np.asarray(action_mimic[-self.num_actions:], dtype=np.float64)
 
-        # Robot's current planar yaw (calc_heading convention: x-axis heading).
-        w, x, y, z = (float(v) for v in self.data.qpos[3:7])
-        dir_x = 1.0 - 2.0 * (y * y + z * z)
-        dir_y = 2.0 * (w * z + x * y)
-        yaw = np.arctan2(dir_y, dir_x)
-
-        # Build ref root quat (w, x, y, z) from (roll, pitch, robot_yaw)
+        # Build ref root quat (w, x, y, z) from (roll, pitch, ref_yaw)
         # using ZYX-extrinsic order: q = q_yaw * q_pitch * q_roll.
-        hr, hp, hy = 0.5 * ref_roll, 0.5 * ref_pitch, 0.5 * yaw
+        hr, hp, hy = 0.5 * ref_roll, 0.5 * ref_pitch, 0.5 * ref_yaw
         cr, sr = np.cos(hr), np.sin(hr)
         cp, sp = np.cos(hp), np.sin(hp)
         cy, sy = np.cos(hy), np.sin(hy)
@@ -463,7 +465,11 @@ class RealTimePolicyController:
             # Planar (yaw-only) base frame; same convention as planar_root_quat_w
             # in DEX_RL_LAB (calc_heading: yaw is the x-axis heading).
             # R_planar maps planar-base -> world, so v_pb = R_planar.T @ v_w == v_w @ R_planar.
-            c, s = np.cos(yaw), np.sin(yaw)
+            qw, qx, qy, qz = (float(v) for v in self.data.qpos[3:7])
+            dir_x = 1.0 - 2.0 * (qy * qy + qz * qz)
+            dir_y = 2.0 * (qw * qz + qx * qy)
+            robot_yaw = np.arctan2(dir_y, dir_x)
+            c, s = np.cos(robot_yaw), np.sin(robot_yaw)
             R_planar = np.array(
                 [[c, -s, 0.0],
                  [s,  c, 0.0],
@@ -516,10 +522,12 @@ class RealTimePolicyController:
 
     def _compute_diff_body_tannorm_pb(self, action_mimic):
         """Compute diff_body_tannorm_pb (matches DEX_RL_LAB mdp.diff_body_tannorm_pb
-        under root xy alignment) as flat [NUM_TRACKED_BODIES * 6] float32.
+        under root xy alignment + motion-start heading anchor) as flat
+        [NUM_TRACKED_BODIES * 6] float32.
 
-        mimic_obs has no absolute yaw, so the ref root yaw is set to the robot's
-        current planar yaw at FK time -- same approach as ``_compute_diff_body_pos_b``.
+        ref yaw is read directly from mimic_obs[5] (motion_server anchors
+        motion frame 0's yaw to robot's heading at playback start), so the ref
+        is in the same world frame as the robot and yaw mismatches show up.
 
         Math:
             diff_q_w  = q_ref_w * conj(q_robot_w)             per body
@@ -529,16 +537,11 @@ class RealTimePolicyController:
         ref_z = float(action_mimic[2])
         ref_roll = float(action_mimic[3])
         ref_pitch = float(action_mimic[4])
+        ref_yaw = float(action_mimic[5])
         ref_dof_pos = np.asarray(action_mimic[-self.num_actions:], dtype=np.float64)
 
-        # Robot's current planar yaw (calc_heading convention).
-        w, x, y, z = (float(v) for v in self.data.qpos[3:7])
-        dir_x = 1.0 - 2.0 * (y * y + z * z)
-        dir_y = 2.0 * (w * z + x * y)
-        yaw = np.arctan2(dir_y, dir_x)
-
-        # Build ref root quat from (roll, pitch, robot_yaw) via ZYX-extrinsic order.
-        hr, hp, hy = 0.5 * ref_roll, 0.5 * ref_pitch, 0.5 * yaw
+        # Build ref root quat from (roll, pitch, ref_yaw) via ZYX-extrinsic order.
+        hr, hp, hy = 0.5 * ref_roll, 0.5 * ref_pitch, 0.5 * ref_yaw
         cr, sr = np.cos(hr), np.sin(hr)
         cp, sp = np.cos(hp), np.sin(hp)
         cy, sy = np.cos(hy), np.sin(hy)
@@ -560,9 +563,14 @@ class RealTimePolicyController:
             self._quat_conj_np(robot_body_quat_w),
         )
 
-        # Robot planar (yaw-only) root quat, broadcast across bodies.
+        # Robot planar (yaw-only) root quat (calc_heading convention),
+        # broadcast across bodies for the planar-frame rotation.
+        qw, qx, qy, qz = (float(v) for v in self.data.qpos[3:7])
+        dir_x = 1.0 - 2.0 * (qy * qy + qz * qz)
+        dir_y = 2.0 * (qw * qz + qx * qy)
+        robot_yaw = np.arctan2(dir_y, dir_x)
         planar_root_quat = np.array(
-            [np.cos(0.5 * yaw), 0.0, 0.0, np.sin(0.5 * yaw)], dtype=np.float64
+            [np.cos(0.5 * robot_yaw), 0.0, 0.0, np.sin(0.5 * robot_yaw)], dtype=np.float64
         )
         inv_planar_root_quat = self._quat_conj_np(planar_root_quat)
 
@@ -607,6 +615,9 @@ class RealTimePolicyController:
         self.redis_pipeline.set("state_body_unitree_g1_with_hands", json.dumps(initial_state_body.tolist()))
         self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
         self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
+        # Publish robot's current planar yaw so motion_server can anchor motion
+        # frame 0's heading to the robot at playback start.
+        self.redis_pipeline.set("state_heading_unitree_g1_with_hands", json.dumps(0.0))
 
         # Seed action_* Redis keys with the idle default so we don't chase a stale
         # target left over from a prior motion server session.
@@ -662,6 +673,13 @@ class RealTimePolicyController:
                     self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
                     self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
                     self.redis_pipeline.set("state_neck_unitree_g1_with_hands", json.dumps(np.zeros(2).tolist()))
+                    # Robot's planar yaw (calc_heading: x-axis heading) — motion_server
+                    # reads this once at playback start to anchor motion frame 0.
+                    qw, qx, qy, qz = (float(v) for v in self.data.qpos[3:7])
+                    _dirx = 1.0 - 2.0 * (qy * qy + qz * qz)
+                    _diry = 2.0 * (qw * qz + qx * qy)
+                    robot_heading = float(np.arctan2(_diry, _dirx))
+                    self.redis_pipeline.set("state_heading_unitree_g1_with_hands", json.dumps(robot_heading))
                     self.redis_pipeline.set("t_state", int(time.time() * 1000))
                     self.redis_pipeline.execute()
 

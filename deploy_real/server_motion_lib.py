@@ -3,6 +3,7 @@ import argparse
 import time
 import redis
 import json
+from typing import Optional
 import numpy as np
 import isaacgym
 import torch
@@ -28,9 +29,20 @@ def build_mimic_obs(
     fix_root_heading: bool = False,
     root_pos_ref: torch.Tensor = None,
     root_rot_ref: torch.Tensor = None,
+    motion_yaw_anchor_delta: Optional[float] = None,
 ):
     """
     Build the mimic_obs at time-step t_step, referencing the code in MimicRunner.
+
+    Output layout (38-dim, ``mask_indicator=False``):
+        [xy_vel_local(2), z(1), roll(1), pitch(1), yaw(1), ang_vel_local(3), dof_pos(29)]
+
+    The ``yaw`` field is the motion's root yaw in the published frame. When
+    ``motion_yaw_anchor_delta`` is provided, every frame is rotated by that
+    constant angle around the world z-axis -- this is how the caller anchors
+    motion frame 0's yaw to the robot's heading at playback start.
+
+    Matches DEX_RL_LAB ``upcoming_twist_mimic_target``.
     """
     device = torch.device("cuda")
     # Build times
@@ -68,6 +80,28 @@ def build_mimic_obs(
         ax, ay, az = root_ang_vel[..., 0], root_ang_vel[..., 1], root_ang_vel[..., 2]
         root_ang_vel = torch.stack([cos_d * ax - sin_d * ay, sin_d * ax + cos_d * ay, az], dim=-1)
 
+    # Anchor motion start to robot heading: rotate every frame by a CONSTANT
+    # delta_yaw around world z. This preserves the motion's yaw progression
+    # (unlike fix_root_heading, which freezes yaw) and just rotates the entire
+    # trajectory so that motion frame 0's yaw matches robot's start yaw.
+    if motion_yaw_anchor_delta is not None:
+        delta = float(motion_yaw_anchor_delta)
+        half = 0.5 * delta
+        cw = float(np.cos(half))
+        sz = float(np.sin(half))
+        x, y, z, w = root_rot[..., 0], root_rot[..., 1], root_rot[..., 2], root_rot[..., 3]
+        root_rot = torch.stack([cw * x - sz * y, sz * x + cw * y, cw * z + sz * w, cw * w - sz * z], dim=-1)
+
+        cos_d = float(np.cos(delta))
+        sin_d = float(np.sin(delta))
+        vx, vy, vz = root_vel[..., 0], root_vel[..., 1], root_vel[..., 2]
+        root_vel = torch.stack([cos_d * vx - sin_d * vy, sin_d * vx + cos_d * vy, vz], dim=-1)
+        ax, ay, az = root_ang_vel[..., 0], root_ang_vel[..., 1], root_ang_vel[..., 2]
+        root_ang_vel = torch.stack([cos_d * ax - sin_d * ay, sin_d * ax + cos_d * ay, az], dim=-1)
+        # Rotate root_pos xy too so the world-frame viz stays consistent (z invariant under z-rot).
+        px, py, pz = root_pos[..., 0], root_pos[..., 1], root_pos[..., 2]
+        root_pos = torch.stack([cos_d * px - sin_d * py, sin_d * px + cos_d * py, pz], dim=-1)
+
     if fix_root_pos and root_pos_ref is not None:
         root_pos = torch.stack([
             torch.full_like(root_pos[..., 0], float(root_pos_ref[0])),
@@ -89,41 +123,29 @@ def build_mimic_obs(
 
     root_pos = root_pos.reshape(1, -1, 3)
     dof_pos = dof_pos.reshape(1, -1, dof_pos.shape[-1])
-    
-    # mimic_obs_buf = torch.cat((
-    #             root_pos,
-    #             roll, pitch, yaw,
-    #             # root_vel,
-    #             # root_ang_vel,
-    #             root_vel_local,
-    #             root_ang_vel_local,
-    #             dof_pos 
-    #         ), dim=-1)[:, 0:1]  # shape (1, 1, ?)
-    # print("root_vel_local: ", root_vel_local)
-    # Modified for better observability: root_vel_xy + root_pos_z + roll_pitch + yaw_ang_vel + dof_pos
+
+    # 38-dim layout: xy_vel(2) + z(1) + roll/pitch(2) + yaw(1) + ang_vel_local(3) + dof(29).
     if mask_indicator:
         mimic_obs_buf = torch.cat((
-                    # root position: xy velocity + z position
-                    root_vel_local[..., :2], # 2 dims (xy velocity instead of xy position)
-                    root_pos[..., 2:3], # 1 dim (z position)
-                    # root rotation: roll/pitch + yaw angular velocity
-                    roll, pitch, # 2 dims (roll/pitch orientation)
-                    root_ang_vel_local[..., 2:3], # 1 dim (yaw angular velocity)
-                    dof_pos,
-                ), dim=-1)[:, :]  # shape (1, 1, 6 + num_dof)
+                    root_vel_local[..., :2],          # 2: xy linear vel (root-local)
+                    root_pos[..., 2:3],               # 1: z
+                    roll, pitch,                      # 2: roll, pitch
+                    yaw,                              # 1: yaw (in published frame)
+                    root_ang_vel_local[..., :],       # 3: full angular velocity (root-local)
+                    dof_pos,                          # 29
+                ), dim=-1)[:, :]  # shape (1, 1, 9 + num_dof)
         # append mask indicator 1
         mask_indicator = torch.ones(1, mimic_obs_buf.shape[1], 1).to(device)
         mimic_obs_buf = torch.cat((mimic_obs_buf, mask_indicator), dim=-1)
     else:
         mimic_obs_buf = torch.cat((
-                    # root position: xy velocity + z position
-                    root_vel_local[..., :2], # 2 dims (xy velocity instead of xy position)
-                    root_pos[..., 2:3], # 1 dim (z position)
-                    # root rotation: roll/pitch + yaw angular velocity
-                    roll, pitch, # 2 dims (roll/pitch orientation)
-                    root_ang_vel_local[..., 2:3], # 1 dim (yaw angular velocity)
-                    dof_pos,
-                ), dim=-1)[:, :]  # shape (1, 1, 6 + num_dof)
+                    root_vel_local[..., :2],          # 2
+                    root_pos[..., 2:3],               # 1
+                    roll, pitch,                      # 2
+                    yaw,                              # 1
+                    root_ang_vel_local[..., :],       # 3
+                    dof_pos,                          # 29
+                ), dim=-1)[:, :]  # shape (1, 1, 9 + num_dof)
 
     # print("root height: ", root_pos[..., 2:3].detach().cpu().numpy().squeeze())
     mimic_obs_buf = mimic_obs_buf.reshape(1, -1)
@@ -169,14 +191,60 @@ def main(args, xml_file, robot_base):
     # Assumes the robot's root (horizontal) and heading always match the reference motion.
     root_pos_ref = None
     root_rot_ref = None
-    if args.fix_root_pos or args.fix_root_heading:
+    motion_yaw_0 = None
+    if args.fix_root_pos or args.fix_root_heading or args.align_motion_start_to_robot_heading:
         ref_motion_ids = torch.zeros(len(tar_motion_steps), dtype=torch.long, device=device)
         ref_times = torch.zeros(len(tar_motion_steps), dtype=torch.float, device=device)
         root_pos_0, root_rot_0, *_ = motion_lib.calc_motion_frame(ref_motion_ids, ref_times)
         root_pos_ref = root_pos_0[0].detach().clone()
         root_rot_ref = root_rot_0[0].detach().clone()
+        # Cache motion frame 0's yaw so we can compute a one-time anchor delta
+        # to robot's heading at playback start.
+        _, _, _yaw_0 = euler_from_quaternion_torch(root_rot_ref.unsqueeze(0), scalar_first=False)
+        motion_yaw_0 = float(_yaw_0.item())
 
-    # 4.5 Extract start frame for end frame if option is enabled
+    # motion_yaw_anchor_delta is set ONCE at motion start (constant for the entire
+    # playback). When set, build_mimic_obs rotates every frame by this delta so
+    # motion frame 0's yaw aligns with the robot's heading at playback start.
+    motion_yaw_anchor_delta = None
+
+    def _read_robot_heading_from_redis(timeout_s: float = 2.0) -> Optional[float]:
+        """Poll Redis for the robot's current planar yaw. Returns None on timeout."""
+        key = f"state_heading_{args.robot}"
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            raw = redis_client.get(key)
+            if raw is not None:
+                try:
+                    return float(json.loads(raw))
+                except Exception:
+                    return float(raw)
+            time.sleep(0.05)
+        return None
+
+    def _compute_anchor_delta() -> Optional[float]:
+        if not args.align_motion_start_to_robot_heading:
+            return None
+        if motion_yaw_0 is None:
+            print("[Motion Server] align_motion_start_to_robot_heading set but motion_yaw_0 unavailable; skipping anchor.")
+            return None
+        robot_yaw = _read_robot_heading_from_redis()
+        if robot_yaw is None:
+            print(f"[Motion Server] No state_heading_{args.robot} on Redis; defaulting anchor delta to 0.")
+            return 0.0
+        delta = robot_yaw - motion_yaw_0
+        print(f"[Motion Server] Anchored motion start yaw to robot heading "
+              f"(robot_yaw={robot_yaw:.4f}, motion_yaw_0={motion_yaw_0:.4f}, delta={delta:.4f}).")
+        return delta
+
+    # If motion plays immediately (no remote control), anchor right now.
+    if not args.use_remote_control:
+        motion_yaw_anchor_delta = _compute_anchor_delta()
+
+    # 4.5 Extract start frame for end frame if option is enabled.
+    # NOTE: start_frame_mimic_obs uses the CURRENT anchor delta (None until motion
+    # actually starts under remote control); recomputed after the start signal
+    # so the idle frame matches the streamed frames once playback begins.
     start_frame_mimic_obs = None
     if args.send_start_frame_as_end_frame:
         start_frame_mimic_obs, _, _, _, _, _ = build_mimic_obs(
@@ -189,6 +257,7 @@ def main(args, xml_file, robot_base):
             fix_root_heading=args.fix_root_heading,
             root_pos_ref=root_pos_ref,
             root_rot_ref=root_rot_ref,
+            motion_yaw_anchor_delta=motion_yaw_anchor_delta,
         )
     # compute num_steps based on motion length
     motion_id = torch.tensor([0], device=device, dtype=torch.long)
@@ -240,6 +309,21 @@ def main(args, xml_file, robot_base):
                 if not motion_started and start_pressed:
                     print("[Motion Server] Start signal received, beginning motion...")
                     motion_started = True
+                    # Anchor motion frame 0's yaw to robot's current heading (read once at start).
+                    motion_yaw_anchor_delta = _compute_anchor_delta()
+                    if args.send_start_frame_as_end_frame:
+                        start_frame_mimic_obs, _, _, _, _, _ = build_mimic_obs(
+                            motion_lib=motion_lib,
+                            t_step=0,
+                            control_dt=control_dt,
+                            tar_motion_steps=tar_motion_steps_tensor,
+                            robot_type=args.robot,
+                            fix_root_pos=args.fix_root_pos,
+                            fix_root_heading=args.fix_root_heading,
+                            root_pos_ref=root_pos_ref,
+                            root_rot_ref=root_rot_ref,
+                            motion_yaw_anchor_delta=motion_yaw_anchor_delta,
+                        )
                 elif not motion_started:
                     # Keep sending default pose while waiting for start signal
                     idle_mimic_obs = start_frame_mimic_obs if args.send_start_frame_as_end_frame and start_frame_mimic_obs is not None else DEFAULT_MIMIC_OBS[args.robot]
@@ -264,6 +348,7 @@ def main(args, xml_file, robot_base):
                 fix_root_heading=args.fix_root_heading,
                 root_pos_ref=root_pos_ref,
                 root_rot_ref=root_rot_ref,
+                motion_yaw_anchor_delta=motion_yaw_anchor_delta,
             )
             
             # Convert to JSON (list) to put into Redis
@@ -351,6 +436,13 @@ if __name__ == "__main__":
     parser.add_argument("--fix_root_heading", action="store_true",
                         help="Fix the motion's root heading (yaw) to the frame-0 reference. "
                              "Assumes the robot's heading always matches the reference motion.")
+    parser.add_argument("--align_motion_start_to_robot_heading", action="store_true",
+                        default=True,
+                        help="At motion start, read the robot's planar yaw from "
+                             "Redis (key: state_heading_<robot>) and rotate the entire "
+                             "motion by a CONSTANT delta so motion frame 0's yaw matches "
+                             "robot's heading. Preserves the motion's yaw progression "
+                             "(unlike --fix_root_heading which freezes yaw).")
     args = parser.parse_args()
 
     args.vis = True
