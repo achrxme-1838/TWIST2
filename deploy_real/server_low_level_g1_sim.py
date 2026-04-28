@@ -280,8 +280,10 @@ class RealTimePolicyController:
         self._mimic_dim = 35   # TODO: MOTION_OBS
 
         # diff_body_pos_b observation (ref-robot per-body position diff in robot base
-        # frame). Assumes the motion server publishes root+heading-aligned mimic_obs,
-        # so the ref root is reconstructible from (z, roll, pitch, dof_pos) alone.
+        # frame). The motion server's mimic_obs carries (z, roll, pitch, dof_pos)
+        # but no absolute yaw, so the ref root yaw is reconstructed at FK time
+        # from the robot's current planar yaw — this keeps ref/robot in the same
+        # heading frame regardless of whether motion_server heading-aligns.
         # In PolicyCfg it has history_length=10 and is declared AFTER
         # future_motion_mimic_target, so it's appended post-mimic in flat_parts.
         self.use_diff_body_pos = use_diff_body_pos
@@ -404,28 +406,43 @@ class RealTimePolicyController:
         ext_pos = parent_pos + np.einsum("bij,bj->bi", parent_mat, self.extended_local_offsets)
         return np.concatenate([tracked_pos, ext_pos], axis=0)
 
-    def _compute_diff_body_pos_b(self, action_mimic):
-        """Compute diff_body_pos_b (matches DEX_RL_LAB mdp.diff_body_pos_b under
-        root+heading alignment) as a flat [NUM_TRACKED_BODIES * 3] float32 array.
+    def _compute_diff_body_pos_b(self, action_mimic, use_pb=False):
+        """Compute diff_body_pos_b/pb (matches DEX_RL_LAB mdp.diff_body_pos_b
+        under root xy alignment) as a flat [NUM_TRACKED_BODIES * 3] float32
+        array.
 
         ``action_mimic`` layout (motion server ``build_mimic_obs``):
             [xy_vel_local(2), z(1), roll(1), pitch(1), yaw_ang_vel_local(1), dof_pos(29)]
-        Under fix_root_pos + fix_root_heading the ref root xy and yaw are both 0,
-        so (z, roll, pitch, dof_pos) fully determines the ref pose for FK.
+        mimic_obs has no absolute yaw, so we use the robot's current planar yaw
+        when constructing the ref root quat — this keeps ref/robot in the same
+        heading frame regardless of whether motion_server heading-aligns. The
+        ref root xy is left at 0 (per-side root subtraction below cancels it).
+
+        If ``use_pb=True``, rotates the world-frame diff into the robot *planar*
+        (yaw-only) base frame -- matches DEX_RL_LAB mdp.diff_body_pos_pb /
+        extended_body_pos_pb. Otherwise uses the full base frame (pelvis xmat).
         """
         ref_z = float(action_mimic[2])
         ref_roll = float(action_mimic[3])
         ref_pitch = float(action_mimic[4])
         ref_dof_pos = np.asarray(action_mimic[-self.num_actions:], dtype=np.float64)
 
-        # Build ref root quat (w, x, y, z) from roll/pitch/yaw=0.
-        hr, hp = 0.5 * ref_roll, 0.5 * ref_pitch
+        # Robot's current planar yaw (calc_heading convention: x-axis heading).
+        w, x, y, z = (float(v) for v in self.data.qpos[3:7])
+        dir_x = 1.0 - 2.0 * (y * y + z * z)
+        dir_y = 2.0 * (w * z + x * y)
+        yaw = np.arctan2(dir_y, dir_x)
+
+        # Build ref root quat (w, x, y, z) from (roll, pitch, robot_yaw)
+        # using ZYX-extrinsic order: q = q_yaw * q_pitch * q_roll.
+        hr, hp, hy = 0.5 * ref_roll, 0.5 * ref_pitch, 0.5 * yaw
         cr, sr = np.cos(hr), np.sin(hr)
         cp, sp = np.cos(hp), np.sin(hp)
-        ref_qw = cr * cp
-        ref_qx = sr * cp
-        ref_qy = cr * sp
-        ref_qz = -sr * sp
+        cy, sy = np.cos(hy), np.sin(hy)
+        ref_qw = cy * cp * cr + sy * sp * sr
+        ref_qx = cy * cp * sr - sy * sp * cr
+        ref_qy = cy * sp * cr + sy * cp * sr
+        ref_qz = sy * cp * cr - cy * sp * sr
 
         self.ref_data.qpos[:3] = (0.0, 0.0, ref_z)
         self.ref_data.qpos[3:7] = (ref_qw, ref_qx, ref_qy, ref_qz)
@@ -442,11 +459,24 @@ class RealTimePolicyController:
         robot_body_rel = robot_body_pos_w - robot_body_pos_w[0:1]
         diff_w = ref_body_rel - robot_body_rel                                  # [N, 3]
 
-        # Rotate world-frame diff into robot base (pelvis) frame.
-        # xmat[pelvis] maps body->world, so (R.T @ v_w) == v_b, i.e. v_b = v_w @ R.
-        pelvis_id = int(self.tracked_body_ids[0])
-        R_body_to_world = self.data.xmat[pelvis_id].reshape(3, 3)
-        diff_b = diff_w @ R_body_to_world
+        if use_pb:
+            # Planar (yaw-only) base frame; same convention as planar_root_quat_w
+            # in DEX_RL_LAB (calc_heading: yaw is the x-axis heading).
+            # R_planar maps planar-base -> world, so v_pb = R_planar.T @ v_w == v_w @ R_planar.
+            c, s = np.cos(yaw), np.sin(yaw)
+            R_planar = np.array(
+                [[c, -s, 0.0],
+                 [s,  c, 0.0],
+                 [0.0, 0.0, 1.0]],
+                dtype=np.float64,
+            )
+            diff_b = diff_w @ R_planar
+        else:
+            # Rotate world-frame diff into robot base (pelvis) frame.
+            # xmat[pelvis] maps body->world, so (R.T @ v_w) == v_b, i.e. v_b = v_w @ R.
+            pelvis_id = int(self.tracked_body_ids[0])
+            R_body_to_world = self.data.xmat[pelvis_id].reshape(3, 3)
+            diff_b = diff_w @ R_body_to_world
         return diff_b.astype(np.float32).reshape(-1)
 
     def _compute_extended_body_quat_w(self, data):
@@ -486,11 +516,10 @@ class RealTimePolicyController:
 
     def _compute_diff_body_tannorm_pb(self, action_mimic):
         """Compute diff_body_tannorm_pb (matches DEX_RL_LAB mdp.diff_body_tannorm_pb
-        under root+heading alignment) as flat [NUM_TRACKED_BODIES * 6] float32.
+        under root xy alignment) as flat [NUM_TRACKED_BODIES * 6] float32.
 
-        Under fix_root_pos + fix_root_heading, the ref root xy and yaw are both 0,
-        so (z, roll, pitch, dof_pos) from action_mimic fully determines the ref
-        pose for FK -- same assumption as ``_compute_diff_body_pos_b``.
+        mimic_obs has no absolute yaw, so the ref root yaw is set to the robot's
+        current planar yaw at FK time -- same approach as ``_compute_diff_body_pos_b``.
 
         Math:
             diff_q_w  = q_ref_w * conj(q_robot_w)             per body
@@ -502,13 +531,21 @@ class RealTimePolicyController:
         ref_pitch = float(action_mimic[4])
         ref_dof_pos = np.asarray(action_mimic[-self.num_actions:], dtype=np.float64)
 
-        hr, hp = 0.5 * ref_roll, 0.5 * ref_pitch
+        # Robot's current planar yaw (calc_heading convention).
+        w, x, y, z = (float(v) for v in self.data.qpos[3:7])
+        dir_x = 1.0 - 2.0 * (y * y + z * z)
+        dir_y = 2.0 * (w * z + x * y)
+        yaw = np.arctan2(dir_y, dir_x)
+
+        # Build ref root quat from (roll, pitch, robot_yaw) via ZYX-extrinsic order.
+        hr, hp, hy = 0.5 * ref_roll, 0.5 * ref_pitch, 0.5 * yaw
         cr, sr = np.cos(hr), np.sin(hr)
         cp, sp = np.cos(hp), np.sin(hp)
-        ref_qw = cr * cp
-        ref_qx = sr * cp
-        ref_qy = cr * sp
-        ref_qz = -sr * sp
+        cy, sy = np.cos(hy), np.sin(hy)
+        ref_qw = cy * cp * cr + sy * sp * sr
+        ref_qx = cy * cp * sr - sy * sp * cr
+        ref_qy = cy * sp * cr + sy * cp * sr
+        ref_qz = sy * cp * cr - cy * sp * sr
 
         self.ref_data.qpos[:3] = (0.0, 0.0, ref_z)
         self.ref_data.qpos[3:7] = (ref_qw, ref_qx, ref_qy, ref_qz)
@@ -524,13 +561,8 @@ class RealTimePolicyController:
         )
 
         # Robot planar (yaw-only) root quat, broadcast across bodies.
-        # yaw is the x-axis heading -- same convention as calc_heading in DEX_RL_LAB.
-        w, x, y, z = (float(v) for v in self.data.qpos[3:7])
-        dir_x = 1.0 - 2.0 * (y * y + z * z)
-        dir_y = 2.0 * (w * z + x * y)
-        yaw_half = 0.5 * np.arctan2(dir_y, dir_x)
         planar_root_quat = np.array(
-            [np.cos(yaw_half), 0.0, 0.0, np.sin(yaw_half)], dtype=np.float64
+            [np.cos(0.5 * yaw), 0.0, 0.0, np.sin(0.5 * yaw)], dtype=np.float64
         )
         inv_planar_root_quat = self._quat_conj_np(planar_root_quat)
 
@@ -660,7 +692,7 @@ class RealTimePolicyController:
                     flat_parts.append(action_mimic)   # TODO: MOTION_OBS
 
                     if self.use_diff_body_pos:
-                        diff_body_pos_b = self._compute_diff_body_pos_b(action_mimic)
+                        diff_body_pos_b = self._compute_diff_body_pos_b(action_mimic, use_pb=True)
                         self._diff_body_pos_hist.append(diff_body_pos_b)
                         flat_parts.append(
                             np.asarray(self._diff_body_pos_hist, dtype=np.float32).reshape(-1)
@@ -806,11 +838,13 @@ def main():
     parser.add_argument("--limit_fps", help="Limit FPS with sleep", default=1, type=int)
     parser.add_argument("--policy_frequency", help="Policy frequency", default=100, type=int)
     parser.add_argument("--use_diff_body_pos", action="store_true",
-                        help="Append diff_body_pos_b observation (32 bodies * 3 = 96 dims) "
-                             "to the obs. Assumes motion server publishes root+heading-aligned mimic_obs.")
+                        help="Append diff_body_pos_b observation (33 bodies * 3 = 99 dims) "
+                             "to the obs. Ref root yaw is taken from the robot's current "
+                             "planar yaw at FK time (mimic_obs has no absolute yaw).")
     parser.add_argument("--use_diff_body_tannorm", action="store_true",
                         help="Append diff_body_tannorm_pb observation (33 bodies * 6 = 198 dims) "
-                             "to the obs. Assumes motion server publishes root+heading-aligned mimic_obs.")
+                             "to the obs. Ref root yaw is taken from the robot's current "
+                             "planar yaw at FK time (mimic_obs has no absolute yaw).")
     args = parser.parse_args()
     
     # Verify policy file exists
