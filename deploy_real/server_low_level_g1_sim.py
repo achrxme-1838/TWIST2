@@ -96,7 +96,8 @@ class RealTimePolicyController:
         self.model.opt.timestep = 0.001
         self.data = mujoco.MjData(self.model)
 
-        self.safety = SafetyController(initial_scale=0.5)
+        # self.safety = SafetyController(initial_scale=0.5)
+        self.safety = SafetyController(initial_scale=1.0)
         self.viewer = mjv.launch_passive(
             self.model, self.data,
             key_callback=self.safety.handle_keycode,

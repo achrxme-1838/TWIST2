@@ -2,9 +2,16 @@
 
 script_dir=$(dirname $(realpath $0))
 # motion_file="${script_dir}/assets/example_motions/0807_yanjie_walk_005.pkl"
-# motion_file="${script_dir}/assets/example_motions/A1-Stand_poses.pkl"
-motion_file="${script_dir}/assets/example_motions/A6_lift_box_poses.pkl"
+
+
+motion_file="${script_dir}/assets/example_motions/A1-Stand_poses.pkl"
+# motion_file="${script_dir}/assets/example_motions/A6_lift_box_poses.pkl"
 # motion_file="${script_dir}/assets/example_motions/B3-walk1_poses.pkl"
+# motion_file="${script_dir}/assets/example_motions/A6-lift_box_t2_poses.pkl"
+
+# motion_file="${script_dir}/assets/example_motions/0014_catching_and_throwing_poses.pkl"   # It fails with 2k but stable with 12k -> seems like due to the OOD
+# motion_file="${script_dir}/assets/example_motions/0018_jumping1_poses.pkl"                # It fails with 2k but stable with 12k -> seems like due to the OOD
+# motion_file="${script_dir}/assets/example_motions/0020_knocking1_poses.pkl"
 
 # Change to deploy_real directory
 cd deploy_real

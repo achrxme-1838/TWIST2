@@ -3,7 +3,7 @@
 source ~/miniconda3/bin/activate twist2
 
 SCRIPT_DIR=$(dirname $(realpath $0))
-ckpt_path=${SCRIPT_DIR}/assets/ckpts/twist2_1017_20k.onnx
+ckpt_path=${SCRIPT_DIR}/assets/ckpts/260429_2nd.onnx
 
 # change the network interface name to your own that connects to the robot
 # net=enp0s31f6
