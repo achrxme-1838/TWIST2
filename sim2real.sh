@@ -16,5 +16,7 @@ python server_low_level_g1_real.py \
     --net ${net} \
     --device cuda \
     --use_hand \
+    --use_diff_body_pos \
+    --use_diff_body_tannorm
     # --smooth_body 0.5
     # --record_proprio \

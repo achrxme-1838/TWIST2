@@ -1,20 +1,44 @@
 #!/usr/bin/env python3
+"""TWIST2 real-robot controller.
+
+Mirrors server_low_level_g1_sim.py: same term-major PolicyCfg observation layout,
+same SDK<->Isaac permutation, same ONNX policy interface. Only the I/O surface
+differs — robot state comes from G1RealWorldEnv (IMU + motor state) and PD runs
+on the robot via env.send_robot_action instead of locally inside MuJoCo.
+
+If --use_diff_body_pos / --use_diff_body_tannorm is set, an auxiliary MjModel
+is loaded and driven by the robot's measured (root_quat, joint_pos) each tick
+so we can run mj_kinematics for the FK-based diff terms.
+"""
 import argparse
-import random
-import time
 import json
-import numpy as np
-import torch
-import redis
+import os
+import time
 from collections import deque
-# from robot_control.common.remote_controller import KeyMap
+
+import numpy as np
+import redis
+import torch
+from rich import print
+
+from data_utils.rot_utils import quatToEuler
+from data_utils.params import DEFAULT_MIMIC_OBS
+
+from cfg import g1_29dof_cfg as cfg
+from observations import (
+    compute_diff_body_pos_b,
+    compute_diff_body_tannorm_b,
+)
+from utils.math import yaw_from_quat
 
 from robot_control.g1_wrapper import G1RealWorldEnv
 from robot_control.config import Config
-import os
-from data_utils.rot_utils import quatToEuler
-
 from robot_control.dex_hand_wrapper import Dex3_1_Controller
+
+try:
+    import mujoco
+except ImportError:
+    mujoco = None
 
 try:
     import onnxruntime as ort
@@ -43,31 +67,22 @@ class OnnxPolicyWrapper:
 
 
 class EMASmoother:
-    """Exponential Moving Average smoother for body actions."""
-    
+    """Exponential Moving Average smoother for body actions (real-only safety)."""
+
     def __init__(self, alpha=0.1, initial_value=None):
-        """
-        Args:
-            alpha: Smoothing factor (0.0=no smoothing, 1.0=maximum smoothing)
-            initial_value: Initial value for smoothing (if None, will use first input)
-        """
         self.alpha = alpha
         self.initialized = False
         self.smoothed_value = initial_value
-        
+
     def smooth(self, new_value):
-        """Apply EMA smoothing to new value."""
         if not self.initialized:
             self.smoothed_value = new_value.copy() if hasattr(new_value, 'copy') else new_value
             self.initialized = True
             return self.smoothed_value
-        
-        # EMA formula: smoothed = alpha * new + (1 - alpha) * previous
         self.smoothed_value = self.alpha * new_value + (1 - self.alpha) * self.smoothed_value
         return self.smoothed_value
-    
+
     def reset(self):
-        """Reset the smoother to uninitialized state."""
         self.initialized = False
         self.smoothed_value = None
 
@@ -90,18 +105,18 @@ def load_onnx_policy(policy_path: str, device: str) -> OnnxPolicyWrapper:
 
 
 class RealTimePolicyController(object):
-    """
-    Real robot controller for TWIST2 policy.
-    Based on server_low_level_g1_real.py but adapted for TWIST2 architecture.
-    """
-    def __init__(self, 
+    def __init__(self,
                  policy_path,
                  config_path,
                  device='cuda',
                  net='eno1',
                  use_hand=False,
                  record_proprio=False,
-                 smooth_body=0.0):
+                 smooth_body=0.0,
+                 xml_file=None,
+                 use_diff_body_pos=False,
+                 use_diff_body_tannorm=False,
+                 ):
         self.redis_client = None
         try:
             self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
@@ -109,8 +124,15 @@ class RealTimePolicyController(object):
         except Exception as e:
             print(f"Error connecting to Redis: {e}")
             exit()
-       
+
         self.config = Config(config_path)
+        # Policy was trained against cfg.DEFAULT_DOF_POS / STIFFNESS / DAMPING —
+        # override the YAML so move_to_default_pos, the hardware PD loop, and
+        # the obs offsets all match the sim2sim setup.
+        self.config.default_angles = cfg.DEFAULT_DOF_POS.astype(np.float32).copy()
+        self.config.kps = cfg.STIFFNESS.astype(np.float32).tolist()
+        self.config.kds = cfg.DAMPING.astype(np.float32).tolist()
+
         self.env = G1RealWorldEnv(net=net, config=self.config)
         self.use_hand = use_hand
         if use_hand:
@@ -119,43 +141,111 @@ class RealTimePolicyController(object):
         self.device = device
         self.policy = load_onnx_policy(policy_path, device)
 
-        self.num_actions = 29
-        self.default_dof_pos = self.config.default_angles
-        
-        # scaling factors
-        self.ang_vel_scale = 0.25
-        self.dof_vel_scale = 0.05
-        self.dof_pos_scale = 1.0
-        self.ankle_idx = [4, 5, 10, 11]
+        self.num_actions = cfg.NUM_ACTIONS
 
-        # TWIST2 observation structure
-        self.n_mimic_obs = 35        # 6 + 29 (modified: root_vel_xy + root_pos_z + roll_pitch + yaw_ang_vel + dof_pos)
-        self.n_proprio = 92          # from config analysis  
-        self.n_obs_single = 127      # n_mimic_obs + n_proprio = 35 + 92 = 127
-        self.history_len = 10
-        
-        self.total_obs_size = self.n_obs_single * (self.history_len + 1) + self.n_mimic_obs  # 127*11 + 35 = 1402
-        
-        print(f"TWIST2 Real Controller Configuration:")
-        print(f"  n_mimic_obs: {self.n_mimic_obs}")
-        print(f"  n_proprio: {self.n_proprio}")
-        print(f"  n_obs_single: {self.n_obs_single}")
-        print(f"  history_len: {self.history_len}")
+        # Robot params (SDK order). Hardware PD uses YAML kps/kds via env.
+        self.default_dof_pos = cfg.DEFAULT_DOF_POS.copy()
+        self.action_scale = np.full(self.num_actions, cfg.ACTION_SCALE, dtype=np.float32)
+
+        # Joint-order permutation between SDK (robot/MuJoCo) and Isaac (policy I/O).
+        self.sdk_to_isaac = np.array(
+            [cfg.SDK_JOINT_NAMES.index(n) for n in cfg.ISAAC_JOINT_NAMES], dtype=np.int64
+        )
+        self.isaac_to_sdk = np.array(
+            [cfg.ISAAC_JOINT_NAMES.index(n) for n in cfg.SDK_JOINT_NAMES], dtype=np.int64
+        )
+        self.default_dof_pos_isaac = self.default_dof_pos[self.sdk_to_isaac]
+        self.ankle_idx_isaac = [cfg.ISAAC_JOINT_NAMES.index(n) for n in cfg.ANKLE_JOINT_NAMES]
+
+        # ----- observation layout (matches DEX_RL_LAB PolicyCfg, term-major) -----
+        self.history_len = cfg.HISTORY_LEN
+        self._hist_dims = cfg.HIST_TERM_DIMS
+        self._hist_term_order = cfg.HIST_TERM_ORDER
+        self._mimic_dim = cfg.MIMIC_DIM
+
+        self.use_diff_body_pos = use_diff_body_pos
+        self._diff_body_pos_per_step = cfg.NUM_TRACKED_BODIES * 3
+        self._diff_body_pos_total = (
+            self.history_len * self._diff_body_pos_per_step if use_diff_body_pos else 0
+        )
+        self.use_diff_body_tannorm = use_diff_body_tannorm
+        self._diff_body_tannorm_per_step = cfg.NUM_TRACKED_BODIES * 6
+        self._diff_body_tannorm_total = (
+            self.history_len * self._diff_body_tannorm_per_step if use_diff_body_tannorm else 0
+        )
+
+        self.total_obs_size = (
+            self.history_len * sum(self._hist_dims.values())
+            + self._mimic_dim
+            + self._diff_body_pos_total
+            + self._diff_body_tannorm_total
+        )
+
+        # MuJoCo model for FK-based diff terms (no viewer, no stepping).
+        self.fk_model = None
+        self.fk_data = None
+        self.ref_data = None
+        self.tracked_body_ids = None
+        self.extended_parent_ids = None
+        self.extended_local_offsets = None
+        if use_diff_body_pos or use_diff_body_tannorm:
+            if mujoco is None:
+                raise ImportError("mujoco is required when --use_diff_body_pos / --use_diff_body_tannorm is set.")
+            if xml_file is None:
+                raise ValueError("xml_file must be provided when diff_body_* terms are enabled.")
+            self.fk_model = mujoco.MjModel.from_xml_path(xml_file)
+            self.fk_data = mujoco.MjData(self.fk_model)
+            self.ref_data = mujoco.MjData(self.fk_model)
+            self.tracked_body_ids = np.array(
+                [self.fk_model.body(n).id for n in cfg.TRACKED_BODY_NAMES], dtype=np.int64
+            )
+            self.extended_parent_ids = np.array(
+                [self.fk_model.body(parent).id for _, parent, _ in cfg.EXTENDED_JOINTS], dtype=np.int64,
+            )
+            self.extended_local_offsets = np.array(
+                [offset for _, _, offset in cfg.EXTENDED_JOINTS], dtype=np.float64
+            )
+
+        # Per-term ring buffers (zero-init mimics IsaacLab CircularBuffer first-push fill).
+        self._hist_bufs = {
+            name: deque(
+                [np.zeros(d, dtype=np.float32) for _ in range(self.history_len)],
+                maxlen=self.history_len,
+            )
+            for name, d in self._hist_dims.items()
+        }
+        self._diff_body_pos_hist = (
+            deque(
+                [np.zeros(self._diff_body_pos_per_step, dtype=np.float32) for _ in range(self.history_len)],
+                maxlen=self.history_len,
+            )
+            if use_diff_body_pos else None
+        )
+        self._diff_body_tannorm_hist = (
+            deque(
+                [np.zeros(self._diff_body_tannorm_per_step, dtype=np.float32) for _ in range(self.history_len)],
+                maxlen=self.history_len,
+            )
+            if use_diff_body_tannorm else None
+        )
+
+        print("TWIST2 Real Controller obs layout (term-major):")
+        for name in self._hist_term_order:
+            d = self._hist_dims[name]
+            print(f"  {name}: history={self.history_len} x dim={d} = {self.history_len * d}")
+        print(f"  future_motion_mimic_target (no history): {self._mimic_dim}")
+        if use_diff_body_pos:
+            print(f"  diff_body_pos_b: history={self.history_len} x dim={self._diff_body_pos_per_step} = {self._diff_body_pos_total}")
+        if use_diff_body_tannorm:
+            print(f"  diff_body_tannorm_b: history={self.history_len} x dim={self._diff_body_tannorm_per_step} = {self._diff_body_tannorm_total}")
         print(f"  total_obs_size: {self.total_obs_size}")
 
-        self.proprio_history_buf = deque(maxlen=self.history_len)
-        for _ in range(self.history_len):
-            self.proprio_history_buf.append(np.zeros(self.n_obs_single, dtype=np.float32))
-
         self.last_action = np.zeros(self.num_actions, dtype=np.float32)
-
         self.control_dt = self.config.control_dt
-        self.action_scale = self.config.action_scale
-        
+
         self.record_proprio = record_proprio
         self.proprio_recordings = [] if record_proprio else None
-        
-        # Smoothing processing
+
         self.smooth_body = smooth_body
         if smooth_body > 0.0:
             self.body_smoother = EMASmoother(alpha=smooth_body)
@@ -163,7 +253,6 @@ class RealTimePolicyController(object):
         else:
             self.body_smoother = None
 
-        
     def reset_robot(self):
         print("Press START on remote to move to default position ...")
         self.env.move_to_default_pos()
@@ -173,127 +262,184 @@ class RealTimePolicyController(object):
 
         print("Robot will hold default pos. If needed, do other checks here.")
 
+    def _update_fk_data(self, dof_pos, quat):
+        """Drive fk_data from measured (quat, dof_pos) and run kinematics."""
+        self.fk_data.qpos[:3] = 0.0  # diff_body_pos_b cancels root translation
+        self.fk_data.qpos[3:7] = quat  # IMU quat (wxyz)
+        self.fk_data.qpos[7:7 + self.num_actions] = dof_pos  # SDK order matches XML
+        mujoco.mj_kinematics(self.fk_model, self.fk_data)
+
+    def compute_observation(self, dof_pos, dof_vel, ang_vel, rpy, action_mimic):
+        """Build the flat observation tensor in PolicyCfg term-major order.
+
+        dof_pos / dof_vel come in SDK order; permuted to Isaac order before the
+        policy sees them. last_action is already in Isaac order (raw policy out).
+        Updates all history buffers as a side effect.
+        """
+        dof_pos_isaac = dof_pos[self.sdk_to_isaac]
+        dof_vel_isaac = dof_vel[self.sdk_to_isaac].copy()
+        dof_vel_isaac[self.ankle_idx_isaac] = 0.0
+
+        term_current = {
+            "base_ang_vel":    (ang_vel * 0.25).astype(np.float32),
+            "base_roll_pitch": rpy[:2].astype(np.float32),
+            "joint_pos_rel":   (dof_pos_isaac - self.default_dof_pos_isaac).astype(np.float32),
+            "joint_vel_rel":   (dof_vel_isaac * 0.05).astype(np.float32),
+            "last_action":     self.last_action.astype(np.float32),
+        }
+        for name in self._hist_term_order:
+            self._hist_bufs[name].append(term_current[name])
+
+        flat_parts = [
+            np.asarray(self._hist_bufs[name], dtype=np.float32).reshape(-1)
+            for name in self._hist_term_order
+        ]
+        flat_parts.append(action_mimic)
+
+        if self.use_diff_body_pos:
+            diff = compute_diff_body_pos_b(
+                self.fk_model, self.fk_data, self.ref_data, action_mimic,
+                self.tracked_body_ids, self.extended_parent_ids, self.extended_local_offsets,
+                self.num_actions, use_pb=True,
+            )
+            self._diff_body_pos_hist.append(diff)
+            flat_parts.append(np.asarray(self._diff_body_pos_hist, dtype=np.float32).reshape(-1))
+
+        if self.use_diff_body_tannorm:
+            diff = compute_diff_body_tannorm_b(
+                self.fk_model, self.fk_data, self.ref_data, action_mimic,
+                self.tracked_body_ids, self.extended_parent_ids,
+                self.num_actions, use_pb=True,
+            )
+            self._diff_body_tannorm_hist.append(diff)
+            flat_parts.append(np.asarray(self._diff_body_tannorm_hist, dtype=np.float32).reshape(-1))
+
+        obs_buf = np.concatenate(flat_parts)
+        assert obs_buf.shape[0] == self.total_obs_size, \
+            f"Expected {self.total_obs_size} obs, got {obs_buf.shape[0]}"
+        return obs_buf
+
     def run(self):
         self.reset_robot()
         print("Begin main TWIST2 policy loop. Press [Select] on remote to exit.")
+
+        # Idle-default seed for action_* keys (avoids chasing stale targets).
+        default_mimic_obs = DEFAULT_MIMIC_OBS["unitree_g1_with_hands"]
+        self.redis_pipeline.set("action_body_unitree_g1_with_hands", json.dumps(default_mimic_obs.tolist()))
+        self.redis_pipeline.set("action_hand_left_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
+        self.redis_pipeline.set("action_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
+        self.redis_pipeline.set("action_neck_unitree_g1_with_hands", json.dumps(np.zeros(2).tolist()))
+        self.redis_pipeline.execute()
+
+        last_policy_time = None
+        policy_execution_times = []
+        policy_step_count = 0
+        policy_fps_print_interval = 100
 
         try:
             while True:
                 t_start = time.time()
 
-                # Send remote control signals to Redis for motion server
+                # Forward remote-controller signals to the motion server.
                 if self.redis_client:
-                    # Send B button status (for motion start)
-                    b_pressed = self.env.read_controller_input().keys == self.env.controller_mapping["B"]
+                    controller_input = self.env.read_controller_input()
+                    b_pressed = controller_input.keys == self.env.controller_mapping["B"]
+                    select_pressed = controller_input.keys == self.env.controller_mapping["select"]
                     self.redis_client.set("motion_start_signal", "1" if b_pressed else "0")
-                    
-                    # Send Select button status (for motion exit)
-                    select_pressed = self.env.read_controller_input().keys == self.env.controller_mapping["select"]
                     self.redis_client.set("motion_exit_signal", "1" if select_pressed else "0")
-                    
+
                 if self.env.read_controller_input().keys == self.env.controller_mapping["select"]:
                     print("Select pressed, exiting main loop.")
                     break
-                
+
                 dof_pos, dof_vel, quat, ang_vel, dof_temp, dof_tau, dof_vol = self.env.get_robot_state()
-                
                 rpy = quatToEuler(quat)
 
-                obs_dof_vel = dof_vel.copy()
-                obs_dof_vel[self.ankle_idx] = 0.0
-
-                obs_proprio = np.concatenate([
-                    ang_vel * self.ang_vel_scale,
-                    rpy[:2], # 只使用 roll 和 pitch
-                    (dof_pos - self.default_dof_pos) * self.dof_pos_scale,
-                    obs_dof_vel * self.dof_vel_scale,
-                    self.last_action
-                ])
-                
-                state_body = np.concatenate([
-                    ang_vel,
-                    rpy[:2],
-                    dof_pos]) # 3+2+29 = 34 dims
-
+                # state_body (teleop bridge input) stays in MuJoCo/SDK order.
+                state_body = np.concatenate([ang_vel, rpy[:2], dof_pos])  # 3+2+29 = 34
                 self.redis_pipeline.set("state_body_unitree_g1_with_hands", json.dumps(state_body.tolist()))
-                
+
                 if self.use_hand:
                     left_hand_state, right_hand_state = self.hand_ctrl.get_hand_state()
                     lh_pos, rh_pos, lh_temp, rh_temp, lh_tau, rh_tau = self.hand_ctrl.get_hand_all_state()
-                    hand_left_json = json.dumps(left_hand_state.tolist())
-                    hand_right_json = json.dumps(right_hand_state.tolist())
-                    self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", hand_left_json)
-                    self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", hand_right_json)
-                
-                # execute the pipeline once here for setting the keys
+                    self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", json.dumps(left_hand_state.tolist()))
+                    self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", json.dumps(right_hand_state.tolist()))
+                else:
+                    self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
+                    self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
+
+                self.redis_pipeline.set("state_neck_unitree_g1_with_hands", json.dumps(np.zeros(2).tolist()))
+                # motion_server reads state_heading once at playback start to anchor frame 0.
+                robot_heading = yaw_from_quat(quat)
+                self.redis_pipeline.set("state_heading_unitree_g1_with_hands", json.dumps(robot_heading))
+                self.redis_pipeline.set("t_state", int(time.time() * 1000))
                 self.redis_pipeline.execute()
 
-                # 5. 从 Redis 接收模仿观察
-                keys = ["action_body_unitree_g1_with_hands", "action_hand_left_unitree_g1_with_hands", "action_hand_right_unitree_g1_with_hands", "action_neck_unitree_g1_with_hands"]
+                keys = [
+                    "action_body_unitree_g1_with_hands",
+                    "action_hand_left_unitree_g1_with_hands",
+                    "action_hand_right_unitree_g1_with_hands",
+                    "action_neck_unitree_g1_with_hands",
+                ]
                 for key in keys:
                     self.redis_pipeline.get(key)
                 redis_results = self.redis_pipeline.execute()
-                action_mimic = json.loads(redis_results[0])
-                action_hand_left = json.loads(redis_results[1])
-                action_hand_right = json.loads(redis_results[2])
-                action_neck = json.loads(redis_results[3])
-                
-                # Apply smoothing to body actions if enabled
+                action_mimic = np.asarray(json.loads(redis_results[0]), dtype=np.float32)
+                action_hand_left_raw = json.loads(redis_results[1])
+                action_hand_right_raw = json.loads(redis_results[2])
+
                 if self.body_smoother is not None:
-                    action_mimic = self.body_smoother.smooth(np.array(action_mimic, dtype=np.float32))
-                    action_mimic = action_mimic.tolist()
-            
-                
+                    action_mimic = self.body_smoother.smooth(action_mimic)
+
                 if self.use_hand:
-                    action_hand_left = np.array(action_hand_left, dtype=np.float32)
-                    action_hand_right = np.array(action_hand_right, dtype=np.float32)
+                    action_hand_left = np.array(action_hand_left_raw, dtype=np.float32)
+                    action_hand_right = np.array(action_hand_right_raw, dtype=np.float32)
                 else:
                     action_hand_left = np.zeros(7, dtype=np.float32)
                     action_hand_right = np.zeros(7, dtype=np.float32)
 
-                obs_full = np.concatenate([action_mimic, obs_proprio])
-                
-                obs_hist = np.array(self.proprio_history_buf).flatten()
-                self.proprio_history_buf.append(obs_full)
-                
-                future_obs = action_mimic.copy()
-                
-                obs_buf = np.concatenate([obs_full, obs_hist, future_obs])
-                
-                assert obs_buf.shape[0] == self.total_obs_size, f"Expected {self.total_obs_size} obs, got {obs_buf.shape[0]}"
-                
+                # Drive FK from measured robot state for diff_body_* terms.
+                if self.fk_data is not None:
+                    self._update_fk_data(dof_pos, quat)
+
+                obs_buf = self.compute_observation(dof_pos, dof_vel, ang_vel, rpy, action_mimic)
+
                 obs_tensor = torch.from_numpy(obs_buf).float().unsqueeze(0).to(self.device)
                 with torch.no_grad():
                     raw_action = self.policy(obs_tensor).cpu().numpy().squeeze()
-                
-                self.last_action = raw_action.copy()
 
+                current_time = time.time()
+                if last_policy_time is not None:
+                    policy_execution_times.append(current_time - last_policy_time)
+                    policy_step_count += 1
+                    if policy_step_count % policy_fps_print_interval == 0:
+                        recent = policy_execution_times[-policy_fps_print_interval:]
+                        avg_interval = float(np.mean(recent))
+                        print(f"Policy Execution FPS (last {policy_fps_print_interval} steps): {1.0/avg_interval:.2f} Hz (avg interval: {avg_interval*1000:.2f}ms)")
+                last_policy_time = current_time
+
+                # raw_action is in Isaac order; permute back to SDK before sending to the robot.
+                self.last_action = raw_action
                 raw_action = np.clip(raw_action, -10.0, 10.0)
-                target_dof_pos = self.default_dof_pos + raw_action * self.action_scale
-
-                # self.redis_client.set("action_low_level_unitree_g1", json.dumps(raw_action.tolist()))
+                pd_target_isaac = raw_action * self.action_scale + self.default_dof_pos_isaac
+                target_dof_pos = pd_target_isaac[self.isaac_to_sdk]
 
                 kp_scale = 1.0
                 kd_scale = 1.0
                 self.env.send_robot_action(target_dof_pos, kp_scale, kd_scale)
-                
+
                 if self.use_hand:
                     self.hand_ctrl.ctrl_dual_hand(action_hand_left, action_hand_right)
-                
-                elapsed = time.time() - t_start
-                if elapsed < self.control_dt:
-                    time.sleep(self.control_dt - elapsed)
 
                 if self.record_proprio:
                     proprio_data = {
                         'timestamp': time.time(),
                         'body_dof_pos': dof_pos.tolist(),
-                        'target_dof_pos': action_mimic.tolist()[-29:],
+                        'target_dof_pos': action_mimic.tolist()[-self.num_actions:],
                         'temperature': dof_temp.tolist(),
                         'tau': dof_tau.tolist(),
                         'voltage': dof_vol.tolist(),
                     }
-                    
                     if self.use_hand:
                         proprio_data['lh_pos'] = lh_pos.tolist()
                         proprio_data['rh_pos'] = rh_pos.tolist()
@@ -302,7 +448,10 @@ class RealTimePolicyController(object):
                         proprio_data['lh_tau'] = lh_tau.tolist()
                         proprio_data['rh_tau'] = rh_tau.tolist()
                     self.proprio_recordings.append(proprio_data)
-                
+
+                elapsed = time.time() - t_start
+                if elapsed < self.control_dt:
+                    time.sleep(self.control_dt - elapsed)
 
         except Exception as e:
             print(f"Error in main loop: {e}")
@@ -312,6 +461,7 @@ class RealTimePolicyController(object):
             if self.record_proprio and self.proprio_recordings:
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
                 filename = f'logs/twist2_real_recordings_{timestamp}.json'
+                os.makedirs(os.path.dirname(filename), exist_ok=True)
                 with open(filename, 'w') as f:
                     json.dump(self.proprio_recordings, f)
                 print(f"Proprioceptive recordings saved as {filename}")
@@ -338,19 +488,25 @@ def main():
                         help='Record proprioceptive data')
     parser.add_argument('--smooth_body', type=float, default=0.0,
                         help='Smoothing factor for body actions (0.0=no smoothing, 1.0=maximum smoothing)')
-    
+    parser.add_argument('--xml', type=str, default='../assets/g1/g1_sim2sim_29dof.xml',
+                        help='MuJoCo XML used for FK when diff_body_* terms are enabled.')
+    parser.add_argument('--use_diff_body_pos', action='store_true',
+                        help='Append diff_body_pos_b observation (33 bodies * 3 = 99 dims).')
+    parser.add_argument('--use_diff_body_tannorm', action='store_true',
+                        help='Append diff_body_tannorm_b observation (33 bodies * 6 = 198 dims).')
+
     args = parser.parse_args()
 
-    
-    # 验证文件存在
     if not os.path.exists(args.policy):
         print(f"Error: Policy file {args.policy} does not exist")
         return
-    
     if not os.path.exists(args.config):
         print(f"Error: Config file {args.config} does not exist")
         return
-    
+    if (args.use_diff_body_pos or args.use_diff_body_tannorm) and not os.path.exists(args.xml):
+        print(f"Error: XML file {args.xml} does not exist (required for diff_body_* terms)")
+        return
+
     print(f"Starting TWIST2 real robot controller...")
     print(f"  Policy file: {args.policy}")
     print(f"  Config file: {args.config}")
@@ -359,8 +515,9 @@ def main():
     print(f"  Use hand: {args.use_hand}")
     print(f"  Record proprio: {args.record_proprio}")
     print(f"  Smooth body: {args.smooth_body}")
-    
-    # 安全提示
+    print(f"  use_diff_body_pos: {args.use_diff_body_pos}")
+    print(f"  use_diff_body_tannorm: {args.use_diff_body_tannorm}")
+
     print("\n" + "="*50)
     print("SAFETY WARNING:")
     print("You are about to run a policy on a real robot.")
@@ -368,7 +525,7 @@ def main():
     print("Press Ctrl+C to stop at any time.")
     print("Use the remote controller [Select] button to exit.")
     print("="*50 + "\n")
-    
+
     controller = RealTimePolicyController(
         policy_path=args.policy,
         config_path=args.config,
@@ -377,10 +534,11 @@ def main():
         use_hand=args.use_hand,
         record_proprio=args.record_proprio,
         smooth_body=args.smooth_body,
+        xml_file=args.xml,
+        use_diff_body_pos=args.use_diff_body_pos,
+        use_diff_body_tannorm=args.use_diff_body_tannorm,
     )
-    
     controller.run()
-    
 
 
 if __name__ == "__main__":
