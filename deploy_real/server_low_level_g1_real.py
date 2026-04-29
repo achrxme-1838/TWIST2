@@ -29,6 +29,7 @@ from observations import (
     compute_diff_body_pos_b,
     compute_diff_body_tannorm_b,
 )
+from safety import SafetyController, StdinKeyListener
 from utils.math import yaw_from_quat
 
 from robot_control.g1_wrapper import G1RealWorldEnv
@@ -253,6 +254,9 @@ class RealTimePolicyController(object):
         else:
             self.body_smoother = None
 
+        # Real-robot starts at 10% PD gain — operator ramps up via 2..9 / X.
+        self.safety = SafetyController(initial_scale=0.1)
+
     def reset_robot(self):
         print("Press START on remote to move to default position ...")
         self.env.move_to_default_pos()
@@ -336,9 +340,13 @@ class RealTimePolicyController(object):
         policy_step_count = 0
         policy_fps_print_interval = 100
 
+        key_listener = StdinKeyListener(self.safety.handle_keycode)
+        key_listener.start()
+
         try:
             while True:
                 t_start = time.time()
+                self.safety.drain()
 
                 # Forward remote-controller signals to the motion server.
                 if self.redis_client:
@@ -424,9 +432,9 @@ class RealTimePolicyController(object):
                 pd_target_isaac = raw_action * self.action_scale + self.default_dof_pos_isaac
                 target_dof_pos = pd_target_isaac[self.isaac_to_sdk]
 
-                kp_scale = 1.0
-                kd_scale = 1.0
-                self.env.send_robot_action(target_dof_pos, kp_scale, kd_scale)
+                self.env.send_robot_action(
+                    target_dof_pos, self.safety.kp_scale, self.safety.kd_scale
+                )
 
                 if self.use_hand:
                     self.hand_ctrl.ctrl_dual_hand(action_hand_left, action_hand_right)
@@ -458,6 +466,9 @@ class RealTimePolicyController(object):
             import traceback
             traceback.print_exc()
         finally:
+            # Restore terminal first so subsequent prints/cleanup are visible
+            # to the operator even if something else in finally throws.
+            key_listener.stop()
             if self.record_proprio and self.proprio_recordings:
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
                 filename = f'logs/twist2_real_recordings_{timestamp}.json'

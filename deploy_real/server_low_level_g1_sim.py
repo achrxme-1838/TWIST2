@@ -20,6 +20,7 @@ from observations import (
     compute_diff_body_pos_b,
     compute_diff_body_tannorm_b,
 )
+from safety import SafetyController
 from utils.math import yaw_from_quat
 
 try:
@@ -95,7 +96,12 @@ class RealTimePolicyController:
         self.model.opt.timestep = 0.001
         self.data = mujoco.MjData(self.model)
 
-        self.viewer = mjv.launch_passive(self.model, self.data, show_left_ui=False, show_right_ui=False)
+        self.safety = SafetyController(initial_scale=0.5)
+        self.viewer = mjv.launch_passive(
+            self.model, self.data,
+            key_callback=self.safety.handle_keycode,
+            show_left_ui=False, show_right_ui=False,
+        )
         self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = 0
         self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = 0
         self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = 0
@@ -328,6 +334,7 @@ class RealTimePolicyController:
         try:
             for i in pbar:
                 t_start = time.time()
+                self.safety.drain()
                 dof_pos, dof_vel, quat, ang_vel, sim_torque = self.extract_data()
 
                 if i % self.sim_decimation == 0:
@@ -419,7 +426,10 @@ class RealTimePolicyController:
                         })
 
                 # PD control
-                torque = (pd_target - dof_pos) * self.stiffness - dof_vel * self.damping
+                torque = (
+                    (pd_target - dof_pos) * self.stiffness * self.safety.kp_scale
+                    - dof_vel * self.damping * self.safety.kd_scale
+                )
                 torque = np.clip(torque, -self.torque_limits, self.torque_limits)
 
                 self.data.ctrl[:] = torque
