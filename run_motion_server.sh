@@ -9,9 +9,12 @@ motion_file="${script_dir}/assets/example_motions/A1-Stand_poses.pkl"
 # motion_file="${script_dir}/assets/example_motions/B3-walk1_poses.pkl"
 # motion_file="${script_dir}/assets/example_motions/A6-lift_box_t2_poses.pkl"
 
-# motion_file="${script_dir}/assets/example_motions/0014_catching_and_throwing_poses.pkl"   # It fails with 2k but stable with 12k -> seems like due to the OOD
-# motion_file="${script_dir}/assets/example_motions/0018_jumping1_poses.pkl"                # It fails with 2k but stable with 12k -> seems like due to the OOD
-# motion_file="${script_dir}/assets/example_motions/0020_knocking1_poses.pkl"
+# motion_file="${script_dir}/assets/example_motions/0014_catching_and_throwing_poses.pkl"
+# motion_file="${script_dir}/assets/example_motions/0022_jumping1_poses.pkl"       
+# motion_file="${script_dir}/assets/example_motions/0016_sitting2_poses.pkl"       
+# motion_file="${script_dir}/assets/example_motions/Trial_upper_left_225_poses.pkl"       
+# motion_file="${script_dir}/assets/example_motions/Subject_1_F_1_poses.pkl"       
+# motion_file="${script_dir}/assets/example_motions/E5-hook_left_poses.pkl"
 
 # Change to deploy_real directory
 cd deploy_real

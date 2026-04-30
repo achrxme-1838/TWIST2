@@ -178,7 +178,7 @@ def main(args, xml_file, robot_base):
 
     # 2. Load motion library
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    motion_lib = MotionLib(args.motion_file, device=device)
+    motion_lib = MotionLib(args.motion_file, device=device, motion_height_adjust=args.motion_height_adjust)
     
     # 3. Prepare the steps array
     tar_motion_steps = [int(x.strip()) for x in args.steps.split(",")]
@@ -436,6 +436,10 @@ if __name__ == "__main__":
     parser.add_argument("--fix_root_heading", action="store_true",
                         help="Fix the motion's root heading (yaw) to the frame-0 reference. "
                              "Assumes the robot's heading always matches the reference motion.")
+    parser.add_argument("--motion_height_adjust", action="store_true",
+                        help="Shift the reference motion vertically so that the lowest body "
+                             "part (typically the foot) over the entire trajectory sits at z=0. "
+                             "Applies a single constant z-offset to root_pos across all frames.")
     parser.add_argument("--align_motion_start_to_robot_heading", action="store_true",
                         default=True,
                         help="At motion start, read the robot's planar yaw from "
