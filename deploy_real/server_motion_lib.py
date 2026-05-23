@@ -30,6 +30,7 @@ def build_mimic_obs(
     root_pos_ref: torch.Tensor = None,
     root_rot_ref: torch.Tensor = None,
     motion_yaw_anchor_delta: Optional[float] = None,
+    playback_speed: float = 1.0,
 ):
     """
     Build the mimic_obs at time-step t_step, referencing the code in MimicRunner.
@@ -45,9 +46,10 @@ def build_mimic_obs(
     Matches DEX_RL_LAB ``upcoming_twist_mimic_target``.
     """
     device = torch.device("cuda")
-    # Build times
-    motion_times = torch.tensor([t_step * control_dt], device=device).unsqueeze(-1)
-    obs_motion_times = tar_motion_steps * control_dt + motion_times
+    # Build times. playback_speed scales the motion-sampling time only (the robot
+    # control loop still runs at control_dt). speed<1 -> slow motion, >1 -> fast.
+    motion_times = torch.tensor([t_step * control_dt * playback_speed], device=device).unsqueeze(-1)
+    obs_motion_times = tar_motion_steps * control_dt * playback_speed + motion_times
     obs_motion_times = obs_motion_times.flatten()
 
     # Suppose we only have a single motion in the .pkl
@@ -55,6 +57,13 @@ def build_mimic_obs(
 
     # Retrieve motion frames
     root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel, local_key_body_pos, root_pos_delta_local, root_rot_delta_local = motion_lib.calc_motion_frame(motion_ids, obs_motion_times)
+
+    # Scale velocities to match the stretched/compressed playback timeline so the
+    # velocity targets in the obs stay consistent with the position progression
+    # (velocity = d(pos)/dt, and dt is scaled by 1/playback_speed).
+    if playback_speed != 1.0:
+        root_vel = root_vel * playback_speed
+        root_ang_vel = root_ang_vel * playback_speed
 
     # Align root heading / horizontal position to the reference (motion frame 0), assuming the
     # robot's root (horizontal) and heading always match the reference motion. root_rot/root_vel/
@@ -258,13 +267,16 @@ def main(args, xml_file, robot_base):
             root_pos_ref=root_pos_ref,
             root_rot_ref=root_rot_ref,
             motion_yaw_anchor_delta=motion_yaw_anchor_delta,
+            playback_speed=args.playback_speed,
         )
-    # compute num_steps based on motion length
+    # compute num_steps based on motion length (scaled by playback speed: slower
+    # playback -> more control steps to cover the same motion).
     motion_id = torch.tensor([0], device=device, dtype=torch.long)
     motion_length = motion_lib.get_motion_length(motion_id)
-    num_steps = int(motion_length / control_dt)
-    
-    print(f"[Motion Server] Streaming for {num_steps} steps at dt={control_dt:.3f} seconds...")
+    num_steps = int(motion_length / (control_dt * args.playback_speed))
+
+    print(f"[Motion Server] Streaming for {num_steps} steps at dt={control_dt:.3f} seconds "
+          f"(playback_speed={args.playback_speed:.2f}x)...")
 
     last_mimic_obs = DEFAULT_MIMIC_OBS[args.robot]
     
@@ -294,6 +306,7 @@ def main(args, xml_file, robot_base):
     try:
         # for t_step in range(num_steps):
         t_step = 0
+        blended = False  # whether the blend-in into motion frame 0 has been done
         while True:
             t0 = time.time()
             
@@ -323,6 +336,7 @@ def main(args, xml_file, robot_base):
                             root_pos_ref=root_pos_ref,
                             root_rot_ref=root_rot_ref,
                             motion_yaw_anchor_delta=motion_yaw_anchor_delta,
+                            playback_speed=args.playback_speed,
                         )
                 elif not motion_started:
                     # Keep sending default pose while waiting for start signal
@@ -337,6 +351,44 @@ def main(args, xml_file, robot_base):
                         time.sleep(control_dt - elapsed)
                     continue
 
+            # Blend-in: on the first iteration after motion starts, smoothly
+            # interpolate from the current (default/idle) pose into the motion's
+            # first frame over args.blend_in_time seconds before playback begins.
+            if not blended:
+                blended = True
+                if args.blend_in_time > 0:
+                    blend_start = (start_frame_mimic_obs
+                                   if args.send_start_frame_as_end_frame and start_frame_mimic_obs is not None
+                                   else DEFAULT_MIMIC_OBS[args.robot])
+                    blend_target, _, _, _, _, _ = build_mimic_obs(
+                        motion_lib=motion_lib,
+                        t_step=0,
+                        control_dt=control_dt,
+                        tar_motion_steps=tar_motion_steps_tensor,
+                        robot_type=args.robot,
+                        fix_root_pos=args.fix_root_pos,
+                        fix_root_heading=args.fix_root_heading,
+                        root_pos_ref=root_pos_ref,
+                        root_rot_ref=root_rot_ref,
+                        motion_yaw_anchor_delta=motion_yaw_anchor_delta,
+                        playback_speed=args.playback_speed,
+                    )
+                    n_blend = max(1, int(args.blend_in_time / control_dt))
+                    print(f"[Motion Server] Blending into motion start over {args.blend_in_time:.1f}s ({n_blend} steps)...")
+                    for i in range(n_blend):
+                        tb = time.time()
+                        alpha = i / n_blend
+                        blend_obs = blend_start + (blend_target - blend_start) * alpha
+                        redis_client.set(f"action_body_{args.robot}", json.dumps(blend_obs.tolist()))
+                        redis_client.set(f"action_hand_left_{args.robot}", json.dumps(np.zeros(7).tolist()))
+                        redis_client.set(f"action_hand_right_{args.robot}", json.dumps(np.zeros(7).tolist()))
+                        redis_client.set(f"action_neck_{args.robot}", json.dumps(np.zeros(2).tolist()))
+                        last_mimic_obs = blend_obs
+                        elapsed = time.time() - tb
+                        if elapsed < control_dt:
+                            time.sleep(control_dt - elapsed)
+                    t0 = time.time()  # reset pace timer after the blend
+
             # Build a mimic obs from the motion library
             mimic_obs, root_pos, root_rot, dof_pos, root_vel, root_ang_vel = build_mimic_obs(
                 motion_lib=motion_lib,
@@ -349,8 +401,9 @@ def main(args, xml_file, robot_base):
                 root_pos_ref=root_pos_ref,
                 root_rot_ref=root_rot_ref,
                 motion_yaw_anchor_delta=motion_yaw_anchor_delta,
+                playback_speed=args.playback_speed,
             )
-            
+
             # Convert to JSON (list) to put into Redis
             mimic_obs_list = mimic_obs.tolist() if mimic_obs.ndim == 1 else mimic_obs.flatten().tolist()
             redis_client.set(f"action_body_{args.robot}", json.dumps(mimic_obs_list))
@@ -429,6 +482,14 @@ if __name__ == "__main__":
     parser.add_argument("--vis", action="store_true", help="Visualize the motion")
     parser.add_argument("--use_remote_control", action="store_true", help="Use remote control signals from robot controller")
     parser.add_argument("--send_start_frame_as_end_frame", action="store_true", help="Use motion's first frame as end frame instead of default pose")
+    parser.add_argument("--blend_in_time", type=float, default=3.0,
+                        help="Seconds to linearly blend from the current (default/idle) pose "
+                             "into the motion's first frame before playback begins. Set 0 to disable.")
+    parser.add_argument("--playback_speed", type=float, default=1.0,
+                        help="Motion playback speed multiplier. <1 plays the motion in slow "
+                             "motion, >1 speeds it up. The robot control loop still runs at "
+                             "control_dt; only the motion-sampling time and the velocity targets "
+                             "are scaled accordingly.")
     parser.add_argument("--redis_ip", type=str, default="localhost", help="Redis IP")
     parser.add_argument("--fix_root_pos", action="store_true",
                         help="Fix the motion's root horizontal (xy) position to the frame-0 reference. "

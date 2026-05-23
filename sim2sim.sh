@@ -5,7 +5,7 @@ SCRIPT_DIR=$(dirname $(realpath $0))
 # ckpt_path=${SCRIPT_DIR}/assets/ckpts/test/student_rl_v1.onnx
 # ckpt_path=${SCRIPT_DIR}/assets/ckpts/test/student_fix_pos_only.onnx
 # ckpt_path=${SCRIPT_DIR}/assets/ckpts/260429_2nd.onnx
-ckpt_path=${SCRIPT_DIR}/assets/ckpts/260430_1st.onnx
+ckpt_path=${SCRIPT_DIR}/assets/ckpts/2_MAPO_260523.onnx
 # ckpt_path=${SCRIPT_DIR}/assets/ckpts/test/student.onnx
 # ckpt_path=${SCRIPT_DIR}/assets/ckpts/twist2_1017_20k.onnx
 # ckpt_path=${SCRIPT_DIR}/assets/ckpts/twist2_1017_25k.onnx
@@ -20,7 +20,8 @@ python server_low_level_g1_sim.py \
     --policy_frequency 50 \
     --limit_fps 1 \
     --use_diff_body_pos \
-    --use_diff_body_tannorm
+    --use_diff_body_tannorm \
+    # --smooth_action 0.8
 
 
     # --policy_frequency 100 \

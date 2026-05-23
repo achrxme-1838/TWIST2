@@ -66,6 +66,27 @@ def load_onnx_policy(policy_path: str, device: str) -> OnnxPolicyWrapper:
     return OnnxPolicyWrapper(session, input_name)
 
 
+class EMASmoother:
+    """Exponential Moving Average smoother for the policy's output action."""
+
+    def __init__(self, alpha=0.1, initial_value=None):
+        self.alpha = alpha
+        self.initialized = False
+        self.smoothed_value = initial_value
+
+    def smooth(self, new_value):
+        if not self.initialized:
+            self.smoothed_value = new_value.copy() if hasattr(new_value, 'copy') else new_value
+            self.initialized = True
+            return self.smoothed_value
+        self.smoothed_value = self.alpha * new_value + (1 - self.alpha) * self.smoothed_value
+        return self.smoothed_value
+
+    def reset(self):
+        self.initialized = False
+        self.smoothed_value = None
+
+
 class RealTimePolicyController:
     def __init__(self,
                  xml_file,
@@ -78,6 +99,7 @@ class RealTimePolicyController:
                  policy_frequency=50,
                  use_diff_body_pos=False,
                  use_diff_body_tannorm=False,
+                 smooth_action=0.0,
                  ):
         self.measure_fps = measure_fps
         self.limit_fps = limit_fps
@@ -116,6 +138,15 @@ class RealTimePolicyController:
         print(f"sim_decimation: {self.sim_decimation}")
 
         self.last_action = np.zeros(self.num_actions, dtype=np.float32)
+
+        # Optional EMA smoothing of the policy's OUTPUT action (motor command).
+        # Does not affect last_action fed back into the observation.
+        self.smooth_action = smooth_action
+        if smooth_action > 0.0:
+            self.action_smoother = EMASmoother(alpha=smooth_action)
+            print(f"Output action smoothing enabled with alpha={smooth_action}")
+        else:
+            self.action_smoother = None
 
         # Robot params (SDK order).
         self.default_dof_pos = cfg.DEFAULT_DOF_POS.copy()
@@ -403,8 +434,12 @@ class RealTimePolicyController:
                     last_policy_time = current_time
 
                     # raw_action is in Isaac order; permute back to SDK before PD.
+                    # Keep last_action as the RAW policy output (obs consistency);
+                    # smoothing only affects the motor command sent to the robot.
                     self.last_action = raw_action
                     raw_action = np.clip(raw_action, -10., 10.)
+                    if self.action_smoother is not None:
+                        raw_action = self.action_smoother.smooth(raw_action)
                     pd_target_isaac = raw_action * self.action_scale + self.default_dof_pos_isaac
                     pd_target = pd_target_isaac[self.isaac_to_sdk]
 
@@ -478,6 +513,10 @@ def main():
                         help="Append diff_body_pos_b observation (33 bodies * 3 = 99 dims).")
     parser.add_argument("--use_diff_body_tannorm", action="store_true",
                         help="Append diff_body_tannorm_b observation (33 bodies * 6 = 198 dims).")
+    parser.add_argument("--smooth_action", type=float, default=0.0,
+                        help="EMA alpha for smoothing the policy's OUTPUT action (motor command). "
+                             "0 disables (default). Smaller alpha = stronger smoothing but more lag. "
+                             "1.0 = no smoothing.")
     args = parser.parse_args()
 
     if not os.path.exists(args.policy):
@@ -506,6 +545,7 @@ def main():
         policy_frequency=args.policy_frequency,
         use_diff_body_pos=args.use_diff_body_pos,
         use_diff_body_tannorm=args.use_diff_body_tannorm,
+        smooth_action=args.smooth_action,
     )
     controller.run()
 
