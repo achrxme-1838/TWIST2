@@ -17,6 +17,8 @@ python server_low_level_g1_real.py \
     --device cuda \
     --use_hand \
     --use_diff_body_pos \
-    --use_diff_body_tannorm
+    --use_diff_body_tannorm \
+    # --kp_scale 1.0 \
+    # --kd_scale 1.0
     # --smooth_body 0.5
     # --record_proprio \

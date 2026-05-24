@@ -117,6 +117,8 @@ class RealTimePolicyController(object):
                  xml_file=None,
                  use_diff_body_pos=False,
                  use_diff_body_tannorm=False,
+                 kp_scale=1.0,
+                 kd_scale=1.0,
                  ):
         self.redis_client = None
         try:
@@ -131,8 +133,8 @@ class RealTimePolicyController(object):
         # override the YAML so move_to_default_pos, the hardware PD loop, and
         # the obs offsets all match the sim2sim setup.
         self.config.default_angles = cfg.DEFAULT_DOF_POS.astype(np.float32).copy()
-        self.config.kps = cfg.STIFFNESS.astype(np.float32).tolist()
-        self.config.kds = cfg.DAMPING.astype(np.float32).tolist()
+        self.config.kps = (cfg.STIFFNESS.astype(np.float32) * kp_scale).tolist()
+        self.config.kds = (cfg.DAMPING.astype(np.float32) * kd_scale).tolist()
 
         self.env = G1RealWorldEnv(net=net, config=self.config)
         self.use_hand = use_hand
@@ -505,6 +507,10 @@ def main():
                         help='Append diff_body_pos_b observation (33 bodies * 3 = 99 dims).')
     parser.add_argument('--use_diff_body_tannorm', action='store_true',
                         help='Append diff_body_tannorm_b observation (33 bodies * 6 = 198 dims).')
+    parser.add_argument('--kp_scale', type=float, default=1.0,
+                        help='Scale factor applied to cfg.STIFFNESS (hardware PD kps).')
+    parser.add_argument('--kd_scale', type=float, default=1.0,
+                        help='Scale factor applied to cfg.DAMPING (hardware PD kds).')
 
     args = parser.parse_args()
 
@@ -528,6 +534,8 @@ def main():
     print(f"  Smooth body: {args.smooth_body}")
     print(f"  use_diff_body_pos: {args.use_diff_body_pos}")
     print(f"  use_diff_body_tannorm: {args.use_diff_body_tannorm}")
+    print(f"  Kp scale: {args.kp_scale}")
+    print(f"  Kd scale: {args.kd_scale}")
 
     print("\n" + "="*50)
     print("SAFETY WARNING:")
@@ -548,6 +556,8 @@ def main():
         xml_file=args.xml,
         use_diff_body_pos=args.use_diff_body_pos,
         use_diff_body_tannorm=args.use_diff_body_tannorm,
+        kp_scale=args.kp_scale,
+        kd_scale=args.kd_scale,
     )
     controller.run()
 

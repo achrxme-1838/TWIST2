@@ -21,8 +21,9 @@ python server_low_level_g1_sim.py \
     --limit_fps 1 \
     --use_diff_body_pos \
     --use_diff_body_tannorm \
+    # --kp_scale 0.9 \
+    # --kd_scale 1.1 \
+
     # --smooth_action 0.8
-
-
     # --policy_frequency 100 \
     # --record_proprio \

@@ -100,6 +100,8 @@ class RealTimePolicyController:
                  use_diff_body_pos=False,
                  use_diff_body_tannorm=False,
                  smooth_action=0.0,
+                 kp_scale=1.0,
+                 kd_scale=1.0,
                  ):
         self.measure_fps = measure_fps
         self.limit_fps = limit_fps
@@ -150,8 +152,8 @@ class RealTimePolicyController:
 
         # Robot params (SDK order).
         self.default_dof_pos = cfg.DEFAULT_DOF_POS.copy()
-        self.stiffness = cfg.STIFFNESS
-        self.damping = cfg.DAMPING
+        self.stiffness = cfg.STIFFNESS * kp_scale
+        self.damping = cfg.DAMPING  * kd_scale
         self.torque_limits = cfg.TORQUE_LIMITS
         self.action_scale = np.full(self.num_actions, cfg.ACTION_SCALE, dtype=np.float32)
 
@@ -517,6 +519,10 @@ def main():
                         help="EMA alpha for smoothing the policy's OUTPUT action (motor command). "
                              "0 disables (default). Smaller alpha = stronger smoothing but more lag. "
                              "1.0 = no smoothing.")
+    parser.add_argument("--kp_scale", type=float, default=0.9,
+                        help="Scale factor applied to cfg.STIFFNESS for PD control.")
+    parser.add_argument("--kd_scale", type=float, default=1.1,
+                        help="Scale factor applied to cfg.DAMPING for PD control.")
     args = parser.parse_args()
 
     if not os.path.exists(args.policy):
@@ -534,6 +540,8 @@ def main():
     print(f"  Record proprio: {args.record_proprio}")
     print(f"  Measure FPS: {args.measure_fps}")
     print(f"  Limit FPS: {args.limit_fps}")
+    print(f"  Kp scale: {args.kp_scale}")
+    print(f"  Kd scale: {args.kd_scale}")
     controller = RealTimePolicyController(
         xml_file=args.xml,
         policy_path=args.policy,
@@ -546,6 +554,8 @@ def main():
         use_diff_body_pos=args.use_diff_body_pos,
         use_diff_body_tannorm=args.use_diff_body_tannorm,
         smooth_action=args.smooth_action,
+        kp_scale=args.kp_scale,
+        kd_scale=args.kd_scale,
     )
     controller.run()
 

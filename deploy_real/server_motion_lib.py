@@ -258,7 +258,7 @@ def main(args, xml_file, robot_base):
     if args.send_start_frame_as_end_frame:
         start_frame_mimic_obs, _, _, _, _, _ = build_mimic_obs(
             motion_lib=motion_lib,
-            t_step=0,
+            t_step=args.start_step,
             control_dt=control_dt,
             tar_motion_steps=tar_motion_steps_tensor,
             robot_type=args.robot,
@@ -274,6 +274,11 @@ def main(args, xml_file, robot_base):
     motion_id = torch.tensor([0], device=device, dtype=torch.long)
     motion_length = motion_lib.get_motion_length(motion_id)
     num_steps = int(motion_length / (control_dt * args.playback_speed))
+
+    # Cap playback at max_step if requested (motion turns off when reached).
+    if args.max_step is not None:
+        num_steps = min(num_steps, args.max_step)
+        print(f"[Motion Server] max_step={args.max_step} -> playback capped at {num_steps} steps.")
 
     print(f"[Motion Server] Streaming for {num_steps} steps at dt={control_dt:.3f} seconds "
           f"(playback_speed={args.playback_speed:.2f}x)...")
@@ -305,7 +310,7 @@ def main(args, xml_file, robot_base):
     
     try:
         # for t_step in range(num_steps):
-        t_step = 0
+        t_step = args.start_step
         blended = False  # whether the blend-in into motion frame 0 has been done
         while True:
             t0 = time.time()
@@ -327,7 +332,7 @@ def main(args, xml_file, robot_base):
                     if args.send_start_frame_as_end_frame:
                         start_frame_mimic_obs, _, _, _, _, _ = build_mimic_obs(
                             motion_lib=motion_lib,
-                            t_step=0,
+                            t_step=args.start_step,
                             control_dt=control_dt,
                             tar_motion_steps=tar_motion_steps_tensor,
                             robot_type=args.robot,
@@ -362,7 +367,7 @@ def main(args, xml_file, robot_base):
                                    else DEFAULT_MIMIC_OBS[args.robot])
                     blend_target, _, _, _, _, _ = build_mimic_obs(
                         motion_lib=motion_lib,
-                        t_step=0,
+                        t_step=args.start_step,
                         control_dt=control_dt,
                         tar_motion_steps=tar_motion_steps_tensor,
                         robot_type=args.robot,
@@ -490,6 +495,14 @@ if __name__ == "__main__":
                              "motion, >1 speeds it up. The robot control loop still runs at "
                              "control_dt; only the motion-sampling time and the velocity targets "
                              "are scaled accordingly.")
+    parser.add_argument("--start_step", type=int, default=0,
+                        help="Control step to begin playback from. The blend-in / "
+                             "idle pose also targets this frame so the motion picks "
+                             "up cleanly. Default 0 starts from the motion beginning.")
+    parser.add_argument("--max_step", type=int, default=None,
+                        help="Stop the motion once this control step is reached. "
+                             "When set, playback ends at min(max_step, motion length). "
+                             "Default None plays the full motion.")
     parser.add_argument("--redis_ip", type=str, default="localhost", help="Redis IP")
     parser.add_argument("--fix_root_pos", action="store_true",
                         help="Fix the motion's root horizontal (xy) position to the frame-0 reference. "
