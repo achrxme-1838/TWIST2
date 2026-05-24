@@ -65,9 +65,9 @@ motion_file="${script_dir}/assets/example_motions/A1-Stand_poses.pkl"
 cd deploy_real
 
 # by default we use our own laptop as the redis server
-redis_ip="localhost"
+# redis_ip="localhost"
 # this is my unitree g1's ip in wifi
-# redis_ip="192.168.110.24"
+redis_ip="192.168.0.23"
 
 
 # Run the motion server

@@ -7,7 +7,8 @@ ckpt_path=${SCRIPT_DIR}/assets/ckpts/260429_2nd.onnx
 
 # change the network interface name to your own that connects to the robot
 # net=enp0s31f6
-net=eno1
+# net=eno1
+net=eth1
 
 cd deploy_real
 
