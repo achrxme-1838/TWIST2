@@ -15,7 +15,7 @@ cd deploy_real
 python server_low_level_g1_real.py \
     --policy ${ckpt_path} \
     --net ${net} \
-    --device cuda \
+    --device cpu \
     --use_hand \
     --use_diff_body_pos \
     --use_diff_body_tannorm \
