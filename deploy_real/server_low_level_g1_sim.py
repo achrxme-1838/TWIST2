@@ -379,12 +379,22 @@ class RealTimePolicyController:
             diff = compute_diff_body_pos_b(
                 self.model, self.data, self.ref_data, action_mimic,
                 self.tracked_body_ids, self.extended_parent_ids, self.extended_local_offsets,
-                self.num_actions, use_pb=False,
+                self.num_actions, use_pb=True,
                 update_robot_w_odom=odom_on,
                 ref_root_xy_w=ref_root_xy_w,
             )
             self._diff_body_pos_hist.append(diff)
             flat_parts.append(np.asarray(self._diff_body_pos_hist, dtype=np.float32).reshape(-1))
+            # diag: world-frame root tracking error (ref - robot) [x,y,z]. Should
+            # hover ~0 when tracking well; a persistent z bias => height calibration,
+            # persistent xy => anchor/translation lag. (~0.5s cadence)
+            self._diff_log_i = getattr(self, "_diff_log_i", 0) + 1
+            if self._diff_log_i % 25 == 0:
+                ref_xy = ref_root_xy_w if ref_root_xy_w is not None else self.data.qpos[:2]
+                dx = float(ref_xy[0]) - float(self.data.qpos[0])
+                dy = float(ref_xy[1]) - float(self.data.qpos[1])
+                dz = float(action_mimic[2]) - float(self.data.qpos[2])
+                print(f"[root err ref-robot] odom={odom_on} x={dx:+.3f} y={dy:+.3f} z={dz:+.3f}")
 
         if self.use_diff_body_tannorm:
             diff = compute_diff_body_tannorm_b(
@@ -609,9 +619,9 @@ def main():
                         help="EMA alpha for smoothing the policy's OUTPUT action (motor command). "
                              "0 disables (default). Smaller alpha = stronger smoothing but more lag. "
                              "1.0 = no smoothing.")
-    parser.add_argument("--kp_scale", type=float, default=0.9,
+    parser.add_argument("--kp_scale", type=float, default=1.0,
                         help="Scale factor applied to cfg.STIFFNESS for PD control.")
-    parser.add_argument("--kd_scale", type=float, default=1.1,
+    parser.add_argument("--kd_scale", type=float, default=1.0,
                         help="Scale factor applied to cfg.DAMPING for PD control.")
     parser.add_argument("--update_robot_w_odom", action="store_true",
                         help="Track the robot world root via odometry so diff_body_* "

@@ -2,7 +2,7 @@
 
 script_dir=$(dirname $(realpath $0))
 
-# motion_file="${script_dir}/assets/example_motions/A1-Stand_poses.pkl"
+motion_file="${script_dir}/assets/example_motions/A1-Stand_poses.pkl"
 
 #### Motion Class (suc / fail)
 # Standing 
@@ -16,7 +16,7 @@ script_dir=$(dirname $(realpath $0))
 # motion_file="${script_dir}/assets/example_motions/E4-cross_right_poses.pkl"       
 # motion_file="${script_dir}/assets/example_motions/E9-body_hook_left_poses.pkl"       
 # motion_file="${script_dir}/assets/MAPO_demo/throw_toss-15-pass_to_left_light-hamada_poses.pkl"  # 1 / 0
-motion_file="${script_dir}/assets/MAPO_demo/0022_throwing_hard1_poses.pkl"  # 5 / 0
+# motion_file="${script_dir}/assets/MAPO_demo/0022_throwing_hard1_poses.pkl"  # 5 / 0
 # motion_file="${script_dir}/assets/MAPO_demo/0024_throwing_hard3_poses.pkl"  # 5 / 0
 # motion_file="${script_dir}/assets/MAPO_demo/Subject_17_F_2_poses.pkl"  # 5 / 0  (raise hands vertically) (speed 1.0 recommended)
 # motion_file="${script_dir}/assets/MAPO_demo/G15-roundhouse_body_right_poses.pkl"  # DANGER!!  (kick) (speed 1.0 is recommended)
@@ -77,12 +77,12 @@ python server_motion_lib.py \
     --vis \
     --redis_ip ${redis_ip} \
     --blend_in_time 1.0 \
-    --playback_speed 1.0 \
+    --playback_speed 0.5 \
     --max_step 1200 \
+
     # --fix_root_heading \
     # --fix_root_pos \
 
     # --start_step 200 \
-    # --playback_speed 1.0
     # --send_start_frame_as_end_frame \
     # --use_remote_control \
