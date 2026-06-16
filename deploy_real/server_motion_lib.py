@@ -18,6 +18,12 @@ from data_utils.rot_utils import euler_from_quaternion_torch, quat_rotate_invers
 from data_utils.params import DEFAULT_MIMIC_OBS
 
 
+# Per-process motion epoch. Each motion-server launch (= one motion) gets a fresh
+# value; the low-level controller watches this to re-anchor the diff_body_* world
+# frame to the robot root whenever a new motion starts.
+MOTION_EPOCH = repr(time.time())
+
+
 def build_mimic_obs(
     motion_lib: MotionLib,
     t_step: int,
@@ -415,6 +421,12 @@ def main(args, xml_file, robot_base):
             redis_client.set(f"action_hand_left_{args.robot}", json.dumps(np.zeros(7).tolist()))
             redis_client.set(f"action_hand_right_{args.robot}", json.dumps(np.zeros(7).tolist()))
             redis_client.set(f"action_neck_{args.robot}", json.dumps(np.zeros(2).tolist()))
+            # Publish the reference root world pose (xyz) + a per-motion epoch so the
+            # low-level controller can anchor the diff_body_* world frame to the
+            # robot root at motion start (used when --update_robot_w_odom is set).
+            ref_root_xyz = np.asarray(root_pos, dtype=np.float64).reshape(-1)[:3]
+            redis_client.set(f"ref_root_world_{args.robot}", json.dumps(ref_root_xyz.tolist()))
+            redis_client.set(f"motion_epoch_{args.robot}", MOTION_EPOCH)
             last_mimic_obs = mimic_obs
             
             # Print or log it

@@ -30,7 +30,7 @@ from observations import (
     compute_diff_body_tannorm_b,
 )
 from safety import SafetyController, StdinKeyListener
-from utils.math import yaw_from_quat
+from utils.math import rpy_to_quat, yaw_from_quat
 
 from robot_control.g1_wrapper import G1RealWorldEnv
 from robot_control.config import Config
@@ -119,7 +119,11 @@ class RealTimePolicyController(object):
                  use_diff_body_tannorm=False,
                  kp_scale=1.0,
                  kd_scale=1.0,
+                 update_robot_w_odom=False,
+                 odom_topic="/Odometry",
+                 robot="unitree_g1_with_hands",
                  ):
+        self.robot = robot
         self.redis_client = None
         try:
             self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
@@ -259,6 +263,23 @@ class RealTimePolicyController(object):
         # Real-robot starts at 10% PD gain — operator ramps up via 2..9 / X.
         self.safety = SafetyController(initial_scale=0.1)
 
+        # ----- odom-based world-root tracking for diff_body_* terms -----
+        # Subscribe to a FAST-LIO style nav_msgs/Odometry topic. The robot world
+        # root (xy, z, yaw) drives the diff_body_* terms so root translation is
+        # tracked; the reference motion root is anchored (per motion) to the
+        # robot's current world root so motion frame 0 coincides with the robot.
+        self.update_robot_w_odom = update_robot_w_odom
+        self.odom_topic = odom_topic
+        self.odom_sub = None
+        self._motion_epoch = None      # last seen motion epoch (new motion -> reset)
+        self._odom_origin_xy = None    # robot world xy at motion start
+        self._ref_origin_xy = None     # reference motion root xy at motion start
+        if self.update_robot_w_odom:
+            from ros_odom import OdomSubscriber
+            self.odom_sub = OdomSubscriber(self.odom_topic)
+            print(f"[odom] subscribing to odometry topic '{self.odom_topic}'.")
+            print("[odom] update_robot_w_odom=True: diff_body_* uses absolute world root.")
+
     def reset_robot(self):
         print("Press START on remote to move to default position ...")
         self.env.move_to_default_pos()
@@ -268,20 +289,80 @@ class RealTimePolicyController(object):
 
         print("Robot will hold default pos. If needed, do other checks here.")
 
-    def _update_fk_data(self, dof_pos, quat):
-        """Drive fk_data from measured (quat, dof_pos) and run kinematics."""
-        self.fk_data.qpos[:3] = 0.0  # diff_body_pos_b cancels root translation
-        self.fk_data.qpos[3:7] = quat  # IMU quat (wxyz)
+    def _update_fk_data(self, dof_pos, quat, rpy=None, odom_pose=None):
+        """Drive fk_data from measured (quat, dof_pos) and run kinematics.
+
+        Default: root pinned at origin with the IMU quat -- diff_body_pos_b cancels
+        root translation. odom mode: root translation comes from odometry and the
+        root yaw from odometry too, while roll/pitch stay from the IMU (more
+        reliable, drift-free). ``rpy`` is the IMU roll/pitch/yaw (quatToEuler).
+        """
+        if odom_pose is None:
+            self.fk_data.qpos[:3] = 0.0  # diff_body_pos_b cancels root translation
+            self.fk_data.qpos[3:7] = quat  # IMU quat (wxyz)
+        else:
+            odom_pos, odom_quat = odom_pose
+            self.fk_data.qpos[:3] = odom_pos                       # world xyz (odom)
+            odom_yaw = yaw_from_quat(odom_quat)
+            self.fk_data.qpos[3:7] = rpy_to_quat(float(rpy[0]), float(rpy[1]), odom_yaw)
         self.fk_data.qpos[7:7 + self.num_actions] = dof_pos  # SDK order matches XML
         mujoco.mj_kinematics(self.fk_model, self.fk_data)
 
-    def compute_observation(self, dof_pos, dof_vel, ang_vel, rpy, action_mimic):
+    def _compute_ref_root_xy_w(self, robot_root_xy):
+        """Resolve the reference motion root xy in the (odom) world frame.
+
+        Reads the motion server's published root + a per-motion epoch from Redis.
+        On a new motion (epoch change) the world origin is re-anchored to the
+        robot's current world root, so the returned ref xy makes motion frame 0
+        coincide with the robot root and then translates with the motion.
+        Returns None when odom mode is off.
+        """
+        if not self.update_robot_w_odom or self.redis_client is None:
+            return None
+        try:
+            raw_epoch = self.redis_client.get(f"motion_epoch_{self.robot}")
+            raw_ref = self.redis_client.get(f"ref_root_world_{self.robot}")
+        except Exception:
+            raw_epoch, raw_ref = None, None
+
+        ref_xy = None
+        if raw_ref is not None:
+            try:
+                ref_root = np.asarray(json.loads(raw_ref), dtype=np.float64)
+                ref_xy = ref_root[:2]
+            except Exception:
+                ref_xy = None
+
+        epoch = raw_epoch.decode() if isinstance(raw_epoch, bytes) else raw_epoch
+        if epoch != self._motion_epoch:
+            # New motion: reset and re-latch the origin on the first frame whose
+            # reference root is actually available (= motion frame 0).
+            self._motion_epoch = epoch
+            self._odom_origin_xy = None
+            self._ref_origin_xy = None
+
+        if ref_xy is None:
+            # Ref root not published yet: pin ref root to the current robot root.
+            return np.asarray(robot_root_xy, dtype=np.float64).copy()
+
+        if self._odom_origin_xy is None:
+            self._odom_origin_xy = np.asarray(robot_root_xy, dtype=np.float64).copy()
+            self._ref_origin_xy = ref_xy.copy()
+        return ref_xy - self._ref_origin_xy + self._odom_origin_xy
+
+    def compute_observation(self, dof_pos, dof_vel, ang_vel, rpy, action_mimic,
+                            ref_root_xy_w=None):
         """Build the flat observation tensor in PolicyCfg term-major order.
 
         dof_pos / dof_vel come in SDK order; permuted to Isaac order before the
         policy sees them. last_action is already in Isaac order (raw policy out).
         Updates all history buffers as a side effect.
         """
+        # Only run the odom (absolute world-root) diff once a world root has been
+        # resolved (odom message received); else fall back to the legacy
+        # pelvis-relative diff so the ref/robot frames stay consistent.
+        odom_on = self.update_robot_w_odom and ref_root_xy_w is not None
+
         dof_pos_isaac = dof_pos[self.sdk_to_isaac]
         dof_vel_isaac = dof_vel[self.sdk_to_isaac].copy()
         dof_vel_isaac[self.ankle_idx_isaac] = 0.0
@@ -306,7 +387,9 @@ class RealTimePolicyController(object):
             diff = compute_diff_body_pos_b(
                 self.fk_model, self.fk_data, self.ref_data, action_mimic,
                 self.tracked_body_ids, self.extended_parent_ids, self.extended_local_offsets,
-                self.num_actions, use_pb=True,
+                self.num_actions, use_pb=False,
+                update_robot_w_odom=odom_on,
+                ref_root_xy_w=ref_root_xy_w,
             )
             self._diff_body_pos_hist.append(diff)
             flat_parts.append(np.asarray(self._diff_body_pos_hist, dtype=np.float32).reshape(-1))
@@ -316,6 +399,8 @@ class RealTimePolicyController(object):
                 self.fk_model, self.fk_data, self.ref_data, action_mimic,
                 self.tracked_body_ids, self.extended_parent_ids,
                 self.num_actions, use_pb=True,
+                update_robot_w_odom=odom_on,
+                ref_root_xy_w=ref_root_xy_w,
             )
             self._diff_body_tannorm_hist.append(diff)
             flat_parts.append(np.asarray(self._diff_body_tannorm_hist, dtype=np.float32).reshape(-1))
@@ -365,6 +450,9 @@ class RealTimePolicyController(object):
                 dof_pos, dof_vel, quat, ang_vel, dof_temp, dof_tau, dof_vol = self.env.get_robot_state()
                 rpy = quatToEuler(quat)
 
+                # Odom world root (FAST-LIO). None until the first message arrives.
+                odom_pose = self.odom_sub.get_pose() if self.odom_sub is not None else None
+
                 # state_body (teleop bridge input) stays in MuJoCo/SDK order.
                 state_body = np.concatenate([ang_vel, rpy[:2], dof_pos])  # 3+2+29 = 34
                 self.redis_pipeline.set("state_body_unitree_g1_with_hands", json.dumps(state_body.tolist()))
@@ -380,7 +468,12 @@ class RealTimePolicyController(object):
 
                 self.redis_pipeline.set("state_neck_unitree_g1_with_hands", json.dumps(np.zeros(2).tolist()))
                 # motion_server reads state_heading once at playback start to anchor frame 0.
-                robot_heading = yaw_from_quat(quat)
+                # In odom mode publish the odom yaw so the motion frame is anchored
+                # to the same heading the diff_body_* terms use (else fall back to IMU).
+                if odom_pose is not None:
+                    robot_heading = yaw_from_quat(odom_pose[1])
+                else:
+                    robot_heading = yaw_from_quat(quat)
                 self.redis_pipeline.set("state_heading_unitree_g1_with_hands", json.dumps(robot_heading))
                 self.redis_pipeline.set("t_state", int(time.time() * 1000))
                 self.redis_pipeline.execute()
@@ -408,11 +501,23 @@ class RealTimePolicyController(object):
                     action_hand_left = np.zeros(7, dtype=np.float32)
                     action_hand_right = np.zeros(7, dtype=np.float32)
 
+                # Odom world-root tracking: anchor the reference root to the robot
+                # world root (xy from odom) and drive FK with the odom root pose.
+                ref_root_xy_w = None
+                if self.update_robot_w_odom and odom_pose is not None:
+                    ref_root_xy_w = self._compute_ref_root_xy_w(odom_pose[0][:2])
+
                 # Drive FK from measured robot state for diff_body_* terms.
                 if self.fk_data is not None:
-                    self._update_fk_data(dof_pos, quat)
+                    self._update_fk_data(
+                        dof_pos, quat, rpy=rpy,
+                        odom_pose=odom_pose if self.update_robot_w_odom else None,
+                    )
 
-                obs_buf = self.compute_observation(dof_pos, dof_vel, ang_vel, rpy, action_mimic)
+                obs_buf = self.compute_observation(
+                    dof_pos, dof_vel, ang_vel, rpy, action_mimic,
+                    ref_root_xy_w=ref_root_xy_w,
+                )
 
                 obs_tensor = torch.from_numpy(obs_buf).float().unsqueeze(0).to(self.device)
                 with torch.no_grad():
@@ -479,6 +584,8 @@ class RealTimePolicyController(object):
                     json.dump(self.proprio_recordings, f)
                 print(f"Proprioceptive recordings saved as {filename}")
 
+            if self.odom_sub is not None:
+                self.odom_sub.close()
             self.env.close()
             if self.use_hand:
                 self.hand_ctrl.close()
@@ -511,6 +618,14 @@ def main():
                         help='Scale factor applied to cfg.STIFFNESS (hardware PD kps).')
     parser.add_argument('--kd_scale', type=float, default=1.0,
                         help='Scale factor applied to cfg.DAMPING (hardware PD kds).')
+    parser.add_argument('--update_robot_w_odom', action='store_true',
+                        help='Track the robot world root via a FAST-LIO odometry topic '
+                             'so diff_body_* uses absolute root translation. Requires '
+                             'rclpy (run from a sourced ROS2 env). The reference motion '
+                             'root is anchored to the robot root at each motion start.')
+    parser.add_argument('--odom_topic', type=str, default='/Odometry',
+                        help='nav_msgs/Odometry topic for the robot world root '
+                             '(used when --update_robot_w_odom is set).')
 
     args = parser.parse_args()
 
@@ -558,6 +673,8 @@ def main():
         use_diff_body_tannorm=args.use_diff_body_tannorm,
         kp_scale=args.kp_scale,
         kd_scale=args.kd_scale,
+        update_robot_w_odom=args.update_robot_w_odom,
+        odom_topic=args.odom_topic,
     )
     controller.run()
 

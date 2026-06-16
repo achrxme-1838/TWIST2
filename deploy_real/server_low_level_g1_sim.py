@@ -102,9 +102,13 @@ class RealTimePolicyController:
                  smooth_action=0.0,
                  kp_scale=1.0,
                  kd_scale=1.0,
+                 update_robot_w_odom=False,
+                 odom_topic="/twist2/sim_odom",
+                 robot="unitree_g1_with_hands",
                  ):
         self.measure_fps = measure_fps
         self.limit_fps = limit_fps
+        self.robot = robot
         self.redis_client = None
         try:
             self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
@@ -253,6 +257,27 @@ class RealTimePolicyController:
             print(f"  diff_body_tannorm_b: history={self.history_len} x dim={self._diff_body_tannorm_per_step} = {self._diff_body_tannorm_total}")
         print(f"  total_obs_size: {self.total_obs_size}")
 
+        # ----- odom-based world-root tracking for diff_body_* terms -----
+        # When enabled, the reference motion root is anchored (per motion) to the
+        # robot's current world root so motion frame 0 coincides with the robot.
+        # In sim the robot world root is MuJoCo GT (data.qpos); we also publish it
+        # as a nav_msgs/Odometry topic so the same topic-based pipeline as the
+        # real robot is exercised.
+        self.update_robot_w_odom = update_robot_w_odom
+        self.odom_topic = odom_topic
+        self.odom_pub = None
+        self._motion_epoch = None      # last seen motion epoch (new motion -> reset)
+        self._odom_origin_xy = None    # robot world xy at motion start
+        self._ref_origin_xy = None     # reference motion root xy at motion start
+        if self.update_robot_w_odom:
+            try:
+                from ros_odom import OdomPublisher
+                self.odom_pub = OdomPublisher(self.odom_topic)
+                print(f"[odom] publishing MuJoCo GT root to ROS topic '{self.odom_topic}'.")
+            except Exception as e:
+                print(f"[odom] OdomPublisher unavailable ({e}); continuing without ROS publish.")
+            print("[odom] update_robot_w_odom=True: diff_body_* uses absolute world root.")
+
         self.record_video = record_video
         self.record_proprio = record_proprio
         self.proprio_recordings = [] if record_proprio else None
@@ -275,13 +300,61 @@ class RealTimePolicyController:
         sim_torque = self.data.ctrl
         return dof_pos, dof_vel, quat, ang_vel, sim_torque
 
-    def compute_observation(self, dof_pos, dof_vel, ang_vel, rpy, action_mimic):
+    def _compute_ref_root_xy_w(self, robot_root_xy):
+        """Resolve the reference motion root xy in the (odom) world frame.
+
+        Reads the motion server's published root + a per-motion epoch from Redis.
+        On a new motion (epoch change) the world origin is re-anchored to the
+        robot's current world root, so the returned ref xy makes motion frame 0
+        coincide with the robot root and then translates with the motion.
+        Returns None when odom mode is off (callers then skip the offset).
+        """
+        if not self.update_robot_w_odom or self.redis_client is None:
+            return None
+        try:
+            raw_epoch = self.redis_client.get(f"motion_epoch_{self.robot}")
+            raw_ref = self.redis_client.get(f"ref_root_world_{self.robot}")
+        except Exception:
+            raw_epoch, raw_ref = None, None
+
+        ref_xy = None
+        if raw_ref is not None:
+            try:
+                ref_root = np.asarray(json.loads(raw_ref), dtype=np.float64)
+                ref_xy = ref_root[:2]
+            except Exception:
+                ref_xy = None
+
+        epoch = raw_epoch.decode() if isinstance(raw_epoch, bytes) else raw_epoch
+        if epoch != self._motion_epoch:
+            # New motion: reset and re-latch the origin on the first frame whose
+            # reference root is actually available (= motion frame 0).
+            self._motion_epoch = epoch
+            self._odom_origin_xy = None
+            self._ref_origin_xy = None
+
+        if ref_xy is None:
+            # Ref root not published yet: pin ref root to the current robot root.
+            return np.asarray(robot_root_xy, dtype=np.float64).copy()
+
+        if self._odom_origin_xy is None:
+            self._odom_origin_xy = np.asarray(robot_root_xy, dtype=np.float64).copy()
+            self._ref_origin_xy = ref_xy.copy()
+        return ref_xy - self._ref_origin_xy + self._odom_origin_xy
+
+    def compute_observation(self, dof_pos, dof_vel, ang_vel, rpy, action_mimic,
+                            ref_root_xy_w=None):
         """Build the flat observation tensor in PolicyCfg term-major order.
 
         dof_pos / dof_vel come in SDK order; permuted to Isaac order before the
         policy sees them. last_action is already in Isaac order (raw policy out).
         Updates all history buffers as a side effect.
         """
+        # Only run the odom (absolute world-root) diff once a world root has been
+        # resolved; otherwise fall back to the legacy pelvis-relative diff so the
+        # ref/robot frames stay consistent.
+        odom_on = self.update_robot_w_odom and ref_root_xy_w is not None
+
         dof_pos_isaac = dof_pos[self.sdk_to_isaac]
         dof_vel_isaac = dof_vel[self.sdk_to_isaac].copy()
         dof_vel_isaac[self.ankle_idx_isaac] = 0.0
@@ -306,7 +379,9 @@ class RealTimePolicyController:
             diff = compute_diff_body_pos_b(
                 self.model, self.data, self.ref_data, action_mimic,
                 self.tracked_body_ids, self.extended_parent_ids, self.extended_local_offsets,
-                self.num_actions, use_pb=True,
+                self.num_actions, use_pb=False,
+                update_robot_w_odom=odom_on,
+                ref_root_xy_w=ref_root_xy_w,
             )
             self._diff_body_pos_hist.append(diff)
             flat_parts.append(np.asarray(self._diff_body_pos_hist, dtype=np.float32).reshape(-1))
@@ -316,6 +391,8 @@ class RealTimePolicyController:
                 self.model, self.data, self.ref_data, action_mimic,
                 self.tracked_body_ids, self.extended_parent_ids,
                 self.num_actions, use_pb=True,
+                update_robot_w_odom=odom_on,
+                ref_root_xy_w=ref_root_xy_w,
             )
             self._diff_body_tannorm_hist.append(diff)
             flat_parts.append(np.asarray(self._diff_body_tannorm_hist, dtype=np.float32).reshape(-1))
@@ -397,7 +474,20 @@ class RealTimePolicyController:
                     redis_results = self.redis_pipeline.execute()
                     action_mimic = np.asarray(json.loads(redis_results[0]), dtype=np.float32)
 
-                    obs_buf = self.compute_observation(dof_pos, dof_vel, ang_vel, rpy, action_mimic)
+                    # Odom world-root tracking. In sim the robot world root is GT
+                    # (data.qpos); publish it to the ROS odom topic so the same
+                    # pipeline as the real robot is exercised, then resolve the
+                    # reference root xy in the anchored world frame.
+                    ref_root_xy_w = None
+                    if self.update_robot_w_odom:
+                        if self.odom_pub is not None:
+                            self.odom_pub.publish(self.data.qpos[:3], self.data.qpos[3:7])
+                        ref_root_xy_w = self._compute_ref_root_xy_w(self.data.qpos[:2])
+
+                    obs_buf = self.compute_observation(
+                        dof_pos, dof_vel, ang_vel, rpy, action_mimic,
+                        ref_root_xy_w=ref_root_xy_w,
+                    )
 
                     obs_tensor = torch.from_numpy(obs_buf).float().unsqueeze(0).to(self.device)
                     with torch.no_grad():
@@ -523,6 +613,14 @@ def main():
                         help="Scale factor applied to cfg.STIFFNESS for PD control.")
     parser.add_argument("--kd_scale", type=float, default=1.1,
                         help="Scale factor applied to cfg.DAMPING for PD control.")
+    parser.add_argument("--update_robot_w_odom", action="store_true",
+                        help="Track the robot world root via odometry so diff_body_* "
+                             "uses absolute root translation. In sim the MuJoCo GT root "
+                             "is published to --odom_topic; the reference motion root is "
+                             "anchored to the robot root at each motion start.")
+    parser.add_argument("--odom_topic", type=str, default="/twist2/sim_odom",
+                        help="nav_msgs/Odometry topic the sim publishes GT root to "
+                             "(used when --update_robot_w_odom is set).")
     args = parser.parse_args()
 
     if not os.path.exists(args.policy):
@@ -556,6 +654,8 @@ def main():
         smooth_action=args.smooth_action,
         kp_scale=args.kp_scale,
         kd_scale=args.kd_scale,
+        update_robot_w_odom=args.update_robot_w_odom,
+        odom_topic=args.odom_topic,
     )
     controller.run()
 

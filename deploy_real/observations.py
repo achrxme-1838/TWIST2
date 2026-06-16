@@ -35,15 +35,26 @@ def compute_extended_body_quat_w(data, tracked_body_ids, extended_parent_ids):
     return np.concatenate([tracked_quat, parent_quat], axis=0)
 
 
-def _drive_ref_data(model, ref_data, action_mimic, num_actions):
-    """Fill ref MjData from mimic root pose + dof pos and run kinematics."""
+def _drive_ref_data(model, ref_data, action_mimic, num_actions, ref_root_xy_w=None):
+    """Fill ref MjData from mimic root pose + dof pos and run kinematics.
+
+    ``ref_root_xy_w`` (odom mode) places the reference root at its world xy in the
+    odom frame (origin anchored to the robot root at motion start). Default None
+    keeps the legacy behaviour of pinning the ref root xy to the origin -- valid
+    because the non-odom diff cancels root translation anyway.
+    """
     ref_z = float(action_mimic[2])
     ref_roll = float(action_mimic[3])
     ref_pitch = float(action_mimic[4])
     ref_yaw = float(action_mimic[5])
     ref_dof_pos = np.asarray(action_mimic[-num_actions:], dtype=np.float64)
 
-    ref_data.qpos[:3] = (0.0, 0.0, ref_z)
+    if ref_root_xy_w is None:
+        ref_data.qpos[:3] = (0.0, 0.0, ref_z)
+    else:
+        ref_data.qpos[0] = float(ref_root_xy_w[0])
+        ref_data.qpos[1] = float(ref_root_xy_w[1])
+        ref_data.qpos[2] = ref_z
     ref_data.qpos[3:7] = rpy_to_quat(ref_roll, ref_pitch, ref_yaw)
     ref_data.qpos[7:7 + num_actions] = ref_dof_pos
     mujoco.mj_kinematics(model, ref_data)
@@ -53,14 +64,28 @@ def compute_diff_body_pos_b(
     model, data, ref_data, action_mimic,
     tracked_body_ids, extended_parent_ids, extended_local_offsets,
     num_actions, use_pb=True,
+    update_robot_w_odom=False, ref_root_xy_w=None,
 ):
     """Per-body world position diff (ref - robot) rotated into robot base frame.
 
-    Each side's pelvis (index 0) is subtracted before diffing so root xy/z offsets
-    cancel. use_pb=True -> planar (yaw-only) base frame (matches diff_body_pos_pb);
+    Default (update_robot_w_odom=False): each side's pelvis (index 0) is
+    subtracted before diffing so root xy/z offsets cancel -- i.e. the motion is
+    assumed glued to the robot root and root translation is ignored.
+
+    update_robot_w_odom=True: the robot root pose comes from odometry (caller
+    drives ``data`` with the odom root, sim GT or FAST-LIO) and the reference
+    root is placed at ``ref_root_xy_w`` in the same (odom) world frame, anchored
+    so motion frame 0 coincides with the robot root at playback start. The
+    pelvis is NOT subtracted, so the diff captures the absolute root translation
+    (and height) error.
+
+    use_pb=True -> planar (yaw-only) base frame (matches diff_body_pos_pb);
     use_pb=False -> full pelvis frame. Returns flat [(N+E)*3] float32.
     """
-    _drive_ref_data(model, ref_data, action_mimic, num_actions)
+    _drive_ref_data(
+        model, ref_data, action_mimic, num_actions,
+        ref_root_xy_w=ref_root_xy_w if update_robot_w_odom else None,
+    )
 
     ref_pos_w = compute_extended_body_pos_w(
         ref_data, tracked_body_ids, extended_parent_ids, extended_local_offsets
@@ -68,7 +93,11 @@ def compute_diff_body_pos_b(
     robot_pos_w = compute_extended_body_pos_w(
         data, tracked_body_ids, extended_parent_ids, extended_local_offsets
     )
-    diff_w = (ref_pos_w - ref_pos_w[0:1]) - (robot_pos_w - robot_pos_w[0:1])
+    if update_robot_w_odom:
+        # World-frame diff incl. root translation (ref/robot share the odom frame).
+        diff_w = ref_pos_w - robot_pos_w
+    else:
+        diff_w = (ref_pos_w - ref_pos_w[0:1]) - (robot_pos_w - robot_pos_w[0:1])
 
     if use_pb:
         # v_pb = R_planar.T @ v_w == v_w @ R_planar.
@@ -84,6 +113,7 @@ def compute_diff_body_tannorm_b(
     model, data, ref_data, action_mimic,
     tracked_body_ids, extended_parent_ids,
     num_actions, use_pb=True,
+    update_robot_w_odom=False, ref_root_xy_w=None,
 ):
     """Per-body 6D tan-norm of ref/robot rotation diff in robot base frame.
 
@@ -92,9 +122,17 @@ def compute_diff_body_tannorm_b(
         tannorm   = [diff_q_b * (1,0,0), diff_q_b * (0,0,1)]   # 6D per body
 
     use_pb=True uses yaw-only base; use_pb=False uses full pelvis quat.
-    Returns flat [(N+E)*6] float32.
+
+    Rotations are translation-invariant, so update_robot_w_odom only matters here
+    through the robot root *orientation*: in odom mode the caller drives ``data``
+    with the odom yaw (roll/pitch still from IMU), so the base frame and robot
+    body quats follow odom. ref_root_xy_w is accepted for signature symmetry; it
+    does not affect body orientations. Returns flat [(N+E)*6] float32.
     """
-    _drive_ref_data(model, ref_data, action_mimic, num_actions)
+    _drive_ref_data(
+        model, ref_data, action_mimic, num_actions,
+        ref_root_xy_w=ref_root_xy_w if update_robot_w_odom else None,
+    )
 
     ref_quat_w = compute_extended_body_quat_w(ref_data, tracked_body_ids, extended_parent_ids)
     robot_quat_w = compute_extended_body_quat_w(data, tracked_body_ids, extended_parent_ids)

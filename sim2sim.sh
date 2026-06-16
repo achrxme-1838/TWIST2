@@ -1,28 +1,35 @@
 SCRIPT_DIR=$(dirname $(realpath $0))
-# ckpt_path=${SCRIPT_DIR}/assets/ckpts/test/student_first_success.onnx
-# ckpt_path=${SCRIPT_DIR}/assets/ckpts/test/student_mass_rand3.onnx
-# ckpt_path=${SCRIPT_DIR}/assets/ckpts/test/student_narrow_frc.onnx
-# ckpt_path=${SCRIPT_DIR}/assets/ckpts/test/student_rl_v1.onnx
-# ckpt_path=${SCRIPT_DIR}/assets/ckpts/test/student_fix_pos_only.onnx
+
 # ckpt_path=${SCRIPT_DIR}/assets/ckpts/260429_2nd.onnx
-ckpt_path=${SCRIPT_DIR}/assets/ckpts/2_MAPO_260523.onnx
-# ckpt_path=${SCRIPT_DIR}/assets/ckpts/test/student.onnx
-# ckpt_path=${SCRIPT_DIR}/assets/ckpts/twist2_1017_20k.onnx
-# ckpt_path=${SCRIPT_DIR}/assets/ckpts/twist2_1017_25k.onnx
+# ckpt_path=${SCRIPT_DIR}/assets/ckpts/2_MAPO_260523.onnx
+# ckpt_path=${SCRIPT_DIR}/assets/ckpts/2_MAPO_260524.onnx  # Seems too premitive teacher is used
+
+
+# ckpt_path=${SCRIPT_DIR}/assets/ckpts/2_MAPO_260523_10k.onnx  # current SOTA
+
+
+# ckpt_path=${SCRIPT_DIR}/assets/ckpts/2_DA_frc_260525.onnx
+
+
+ckpt_path=${SCRIPT_DIR}/assets/ckpts/2_MAPO_wo_fix_260616.onnx
+
 
 cd deploy_real
 
 python server_low_level_g1_sim.py \
     --xml ../assets/g1/g1_sim2sim_29dof.xml \
     --policy ${ckpt_path} \
-    --device cuda \
+    --device cpu \
     --measure_fps 1 \
     --policy_frequency 50 \
     --limit_fps 1 \
     --use_diff_body_pos \
     --use_diff_body_tannorm \
-    # --kp_scale 0.9 \
-    # --kd_scale 1.1 \
+    --update_robot_w_odom \
+    --odom_topic /twist2/sim_odom \
+
+    # --kp_scale 0.85 \
+    # --kd_scale 1.2 \
 
     # --smooth_action 0.8
     # --policy_frequency 100 \

@@ -19,6 +19,13 @@ python server_low_level_g1_real.py \
     --use_hand \
     --use_diff_body_pos \
     --use_diff_body_tannorm \
+    # --- world-root tracking via FAST-LIO odometry (groundwork) ---
+    # Requires rclpy: launch from a sourced ROS2 (Humble) env with a matching Python
+    # (the twist2 py3.8 env above cannot import rclpy). When enabled, the robot world
+    # root (xy, z, yaw) comes from --odom_topic and the reference motion root is
+    # anchored to the robot root at each motion start. Run the motion server too.
+    # --update_robot_w_odom \
+    # --odom_topic /Odometry \
     # --kp_scale 1.0 \
     # --kd_scale 1.0
     # --smooth_body 0.5
