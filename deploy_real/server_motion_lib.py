@@ -16,6 +16,7 @@ from pose.utils.motion_lib_pkl import MotionLib
 from data_utils.rot_utils import euler_from_quaternion_torch, quat_rotate_inverse_torch
 
 from data_utils.params import DEFAULT_MIMIC_OBS
+from cfg import g1_29dof_cfg as cfg
 
 
 # Per-process motion epoch. Each motion-server launch (= one motion) gets a fresh
@@ -199,6 +200,13 @@ def main(args, xml_file, robot_base):
     tar_motion_steps = [int(x.strip()) for x in args.steps.split(",")]
     tar_motion_steps_tensor = torch.tensor(tar_motion_steps, device=device, dtype=torch.long)
 
+    # Future-frame steps for future_motion_pos_h / future_motion_anchor. Fixed to
+    # the training schedule ([5, 10, ..., 50] control steps = (i+1)*step_interval),
+    # independent of --steps (which only controls the single mimic target).
+    tar_future_steps_tensor = torch.tensor(
+        cfg.FUTURE_MOTION_STEPS, device=device, dtype=torch.long
+    )
+
     # 4. Loop over time steps and publish mimic obs
     control_dt = 0.02
 
@@ -251,6 +259,34 @@ def main(args, xml_file, robot_base):
         print(f"[Motion Server] Anchored motion start yaw to robot heading "
               f"(robot_yaw={robot_yaw:.4f}, motion_yaw_0={motion_yaw_0:.4f}, delta={delta:.4f}).")
         return delta
+
+    def _publish_future_frames(t_step_for_future: int):
+        """Publish the T future reference frames (root_pos / root_rot / dof_pos) so
+        the low-level controller can build future_motion_pos_h / future_motion_anchor.
+
+        Uses the same build_mimic_obs frame computation as the mimic target (so the
+        yaw-anchor, fix_root and playback-speed transforms are applied identically),
+        but sampled at the fixed future schedule. root_rot is published as xyzw
+        (motion-lib convention); the controller converts to wxyz."""
+        _, fr_pos, fr_rot, fr_dof, _, _ = build_mimic_obs(
+            motion_lib=motion_lib,
+            t_step=t_step_for_future,
+            control_dt=control_dt,
+            tar_motion_steps=tar_future_steps_tensor,
+            robot_type=args.robot,
+            fix_root_pos=args.fix_root_pos,
+            fix_root_heading=args.fix_root_heading,
+            root_pos_ref=root_pos_ref,
+            root_rot_ref=root_rot_ref,
+            motion_yaw_anchor_delta=motion_yaw_anchor_delta,
+            playback_speed=args.playback_speed,
+        )
+        redis_client.set(f"{cfg.FUTURE_MOTION_ROOT_POS_KEY}_{args.robot}",
+                         json.dumps(np.asarray(fr_pos, dtype=np.float64).reshape(-1).tolist()))
+        redis_client.set(f"{cfg.FUTURE_MOTION_ROOT_ROT_KEY}_{args.robot}",
+                         json.dumps(np.asarray(fr_rot, dtype=np.float64).reshape(-1).tolist()))
+        redis_client.set(f"{cfg.FUTURE_MOTION_DOF_POS_KEY}_{args.robot}",
+                         json.dumps(np.asarray(fr_dof, dtype=np.float64).reshape(-1).tolist()))
 
     # If motion plays immediately (no remote control), anchor right now.
     if not args.use_remote_control:
@@ -355,6 +391,8 @@ def main(args, xml_file, robot_base):
                     redis_client.set(f"action_body_{args.robot}", json.dumps(idle_mimic_obs.tolist()))
                     redis_client.set(f"action_hand_left_{args.robot}", json.dumps(np.zeros(7).tolist()))
                     redis_client.set(f"action_hand_right_{args.robot}", json.dumps(np.zeros(7).tolist()))
+                    # Keep the future frames fresh for the upcoming start.
+                    _publish_future_frames(args.start_step)
 
                     # Sleep and continue to next iteration
                     elapsed = time.time() - t0
@@ -427,6 +465,8 @@ def main(args, xml_file, robot_base):
             ref_root_xyz = np.asarray(root_pos, dtype=np.float64).reshape(-1)[:3]
             redis_client.set(f"ref_root_world_{args.robot}", json.dumps(ref_root_xyz.tolist()))
             redis_client.set(f"motion_epoch_{args.robot}", MOTION_EPOCH)
+            # Publish the T future reference frames for future_motion_pos_h / anchor.
+            _publish_future_frames(t_step)
             last_mimic_obs = mimic_obs
             
             # Print or log it

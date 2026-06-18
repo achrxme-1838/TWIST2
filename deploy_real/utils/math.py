@@ -49,6 +49,35 @@ def yaw_from_quat(q) -> float:
     return float(np.arctan2(dir_y, dir_x))
 
 
+def heading_quat_from_quat(q, inverse: bool = False) -> np.ndarray:
+    """Yaw-only (heading) quat from a wxyz quat, calc_heading (x-axis) convention.
+
+    Matches DEX_RL_LAB ``calc_heading_quat`` (``inverse=False``) and
+    ``calc_heading_quat_inv`` (``inverse=True``). Returns (w, x, y, z).
+    """
+    yaw = yaw_from_quat(q)
+    if inverse:
+        yaw = -yaw
+    h = 0.5 * yaw
+    return np.array([np.cos(h), 0.0, 0.0, np.sin(h)], dtype=np.float64)
+
+
+def quat_to_rot6d(q: np.ndarray) -> np.ndarray:
+    """wxyz quaternion(s) -> 6D rotation rep (first two rotation-matrix columns).
+
+    Matches DEX_RL_LAB ``quat_to_rot6d`` (matrix_from_quat, columns 0 and 1).
+    Shape (..., 4) -> (..., 6).
+    """
+    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    col0 = np.stack([
+        1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z), 2.0 * (x * z - w * y),
+    ], axis=-1)
+    col1 = np.stack([
+        2.0 * (x * y - w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x),
+    ], axis=-1)
+    return np.concatenate([col0, col1], axis=-1)
+
+
 def planar_rot_matrix(yaw: float) -> np.ndarray:
     """Rotation matrix for planar (yaw-only) frame: planar_base -> world."""
     c, s = np.cos(yaw), np.sin(yaw)

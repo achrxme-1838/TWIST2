@@ -19,7 +19,7 @@ motion_file="${script_dir}/assets/example_motions/A1-Stand_poses.pkl"
 # motion_file="${script_dir}/assets/MAPO_demo/0022_throwing_hard1_poses.pkl"  # 5 / 0
 # motion_file="${script_dir}/assets/MAPO_demo/0024_throwing_hard3_poses.pkl"  # 5 / 0
 # motion_file="${script_dir}/assets/MAPO_demo/Subject_17_F_2_poses.pkl"  # 5 / 0  (raise hands vertically) (speed 1.0 recommended)
-# motion_file="${script_dir}/assets/MAPO_demo/G15-roundhouse_body_right_poses.pkl"  # DANGER!!  (kick) (speed 1.0 is recommended)
+# motion_file="${script_dir}/assets/MAPO_demo/G15-roundhouse_body_right_poses.pkl"  # DANGER!!  (kick) (speed 0.5 is recommended)
 
 
 # Slight Bending
@@ -76,9 +76,10 @@ python server_motion_lib.py \
     --robot unitree_g1_with_hands \
     --vis \
     --redis_ip ${redis_ip} \
+    --steps 5 \
     --blend_in_time 1.0 \
     --playback_speed 0.5 \
-    --max_step 1200 \
+    --max_step 2000 \
 
     # --fix_root_heading \
     # --fix_root_pos \

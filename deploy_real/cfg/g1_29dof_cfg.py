@@ -120,3 +120,24 @@ HIST_TERM_ORDER = [
 
 # upcoming_twist_mimic_target dim: xy_vel(2)+z(1)+rpy(3)+ang_vel(3)+dof_pos(29).
 MIMIC_DIM = 38
+
+# ----- future motion observations (future_motion_pos_h / future_motion_anchor) -----
+# Mirrors DEX_RL_LAB RefMotionCommandCfg(num_future_steps=10, step_interval=5).
+# Future step i (0-indexed) is (i+1)*FUTURE_STEP_INTERVAL env steps ahead. With the
+# env dt = decimation*sim.dt = 0.02s, that is 0.1s .. 1.0s ahead (1s horizon).
+NUM_FUTURE_STEPS = 10
+FUTURE_STEP_INTERVAL = 5
+# Control-step offsets the motion server samples for the future frames
+# ([5, 10, ..., 50]). Units of the motion server control_dt (0.02s), which equals
+# the training env dt, so the sampled times match training exactly.
+FUTURE_MOTION_STEPS = [(i + 1) * FUTURE_STEP_INTERVAL for i in range(NUM_FUTURE_STEPS)]
+# future_motion_pos_h:    T * B * 3 (heading-frame extended body positions).
+# future_motion_anchor:   T * 6     (heading-corrected base->ref-root rot, 6D).
+FUTURE_MOTION_POS_DIM = NUM_FUTURE_STEPS * NUM_TRACKED_BODIES * 3  # 10*33*3 = 990
+FUTURE_MOTION_ANCHOR_DIM = NUM_FUTURE_STEPS * 6                    # 10*6   = 60
+
+# Redis keys the motion server publishes the future reference frames to. Each holds
+# a flattened JSON list: root_pos [T*3], root_rot [T*4] (xyzw), dof_pos [T*J] (SDK order).
+FUTURE_MOTION_ROOT_POS_KEY = "future_motion_root_pos"
+FUTURE_MOTION_ROOT_ROT_KEY = "future_motion_root_rot"
+FUTURE_MOTION_DOF_POS_KEY = "future_motion_dof_pos"

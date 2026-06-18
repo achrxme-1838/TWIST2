@@ -28,6 +28,8 @@ from cfg import g1_29dof_cfg as cfg
 from observations import (
     compute_diff_body_pos_b,
     compute_diff_body_tannorm_b,
+    compute_future_motion_obs,
+    parse_future_raw,
 )
 from safety import SafetyController, StdinKeyListener
 from utils.math import rpy_to_quat, yaw_from_quat
@@ -117,6 +119,7 @@ class RealTimePolicyController(object):
                  xml_file=None,
                  use_diff_body_pos=False,
                  use_diff_body_tannorm=False,
+                 use_future_motion=False,
                  kp_scale=1.0,
                  kd_scale=1.0,
                  update_robot_w_odom=False,
@@ -181,28 +184,39 @@ class RealTimePolicyController(object):
             self.history_len * self._diff_body_tannorm_per_step if use_diff_body_tannorm else 0
         )
 
+        # Future-motion terms (no history): future_motion_pos_h + future_motion_anchor.
+        self.use_future_motion = use_future_motion
+        self._future_motion_pos_total = cfg.FUTURE_MOTION_POS_DIM if use_future_motion else 0
+        self._future_motion_anchor_total = cfg.FUTURE_MOTION_ANCHOR_DIM if use_future_motion else 0
+
         self.total_obs_size = (
             self.history_len * sum(self._hist_dims.values())
             + self._mimic_dim
             + self._diff_body_pos_total
             + self._diff_body_tannorm_total
+            + self._future_motion_pos_total
+            + self._future_motion_anchor_total
         )
 
-        # MuJoCo model for FK-based diff terms (no viewer, no stepping).
+        # MuJoCo model for FK-based diff / future-motion terms (no viewer, no stepping).
         self.fk_model = None
         self.fk_data = None
         self.ref_data = None
+        self.future_ref_data = None
         self.tracked_body_ids = None
         self.extended_parent_ids = None
         self.extended_local_offsets = None
-        if use_diff_body_pos or use_diff_body_tannorm:
+        if use_diff_body_pos or use_diff_body_tannorm or use_future_motion:
             if mujoco is None:
-                raise ImportError("mujoco is required when --use_diff_body_pos / --use_diff_body_tannorm is set.")
+                raise ImportError("mujoco is required when --use_diff_body_pos / --use_diff_body_tannorm / --use_future_motion is set.")
             if xml_file is None:
-                raise ValueError("xml_file must be provided when diff_body_* terms are enabled.")
+                raise ValueError("xml_file must be provided when diff_body_* / future_motion terms are enabled.")
             self.fk_model = mujoco.MjModel.from_xml_path(xml_file)
             self.fk_data = mujoco.MjData(self.fk_model)
-            self.ref_data = mujoco.MjData(self.fk_model)
+            if use_diff_body_pos or use_diff_body_tannorm:
+                self.ref_data = mujoco.MjData(self.fk_model)
+            if use_future_motion:
+                self.future_ref_data = mujoco.MjData(self.fk_model)
             self.tracked_body_ids = np.array(
                 [self.fk_model.body(n).id for n in cfg.TRACKED_BODY_NAMES], dtype=np.int64
             )
@@ -245,6 +259,9 @@ class RealTimePolicyController(object):
             print(f"  diff_body_pos_b: history={self.history_len} x dim={self._diff_body_pos_per_step} = {self._diff_body_pos_total}")
         if use_diff_body_tannorm:
             print(f"  diff_body_tannorm_b: history={self.history_len} x dim={self._diff_body_tannorm_per_step} = {self._diff_body_tannorm_total}")
+        if use_future_motion:
+            print(f"  future_motion_pos_h (no history): {self._future_motion_pos_total}")
+            print(f"  future_motion_anchor (no history): {self._future_motion_anchor_total}")
         print(f"  total_obs_size: {self.total_obs_size}")
 
         self.last_action = np.zeros(self.num_actions, dtype=np.float32)
@@ -350,8 +367,19 @@ class RealTimePolicyController(object):
             self._ref_origin_xy = ref_xy.copy()
         return ref_xy - self._ref_origin_xy + self._odom_origin_xy
 
+    def _anchor_delta_xy(self):
+        """xy translation mapping the published motion frame -> robot world frame.
+
+        Equal to ``odom_origin_xy - ref_origin_xy`` once latched at motion start;
+        the same constant offset the odom diff_body terms apply. Used to place the
+        published future reference frames into the robot world frame. Returns None
+        until the anchor has latched (callers then skip the shift)."""
+        if self._odom_origin_xy is not None and self._ref_origin_xy is not None:
+            return self._odom_origin_xy - self._ref_origin_xy
+        return None
+
     def compute_observation(self, dof_pos, dof_vel, ang_vel, rpy, action_mimic,
-                            ref_root_xy_w=None):
+                            ref_root_xy_w=None, future_raw=None):
         """Build the flat observation tensor in PolicyCfg term-major order.
 
         dof_pos / dof_vel come in SDK order; permuted to Isaac order before the
@@ -404,6 +432,22 @@ class RealTimePolicyController(object):
             )
             self._diff_body_tannorm_hist.append(diff)
             flat_parts.append(np.asarray(self._diff_body_tannorm_hist, dtype=np.float32).reshape(-1))
+
+        if self.use_future_motion:
+            # Robot world root comes from fk_data (odom xyz + odom yaw + IMU
+            # roll/pitch in odom mode; origin + IMU quat otherwise).
+            pos_h, anchor = compute_future_motion_obs(
+                self.fk_model, self.future_ref_data,
+                cfg.NUM_FUTURE_STEPS, self.num_actions,
+                self.tracked_body_ids, self.extended_parent_ids, self.extended_local_offsets,
+                self.fk_data.qpos[:3].copy(), self.fk_data.qpos[3:7].copy(),
+                future_raw=future_raw,
+                anchor_delta_xy=self._anchor_delta_xy() if odom_on else None,
+                fallback_action_mimic=action_mimic,
+                fallback_root_xy=ref_root_xy_w,
+            )
+            flat_parts.append(pos_h)
+            flat_parts.append(anchor)
 
         obs_buf = np.concatenate(flat_parts)
         assert obs_buf.shape[0] == self.total_obs_size, \
@@ -484,12 +528,25 @@ class RealTimePolicyController(object):
                     "action_hand_right_unitree_g1_with_hands",
                     "action_neck_unitree_g1_with_hands",
                 ]
+                if self.use_future_motion:
+                    keys += [
+                        f"{cfg.FUTURE_MOTION_ROOT_POS_KEY}_{self.robot}",
+                        f"{cfg.FUTURE_MOTION_ROOT_ROT_KEY}_{self.robot}",
+                        f"{cfg.FUTURE_MOTION_DOF_POS_KEY}_{self.robot}",
+                    ]
                 for key in keys:
                     self.redis_pipeline.get(key)
                 redis_results = self.redis_pipeline.execute()
                 action_mimic = np.asarray(json.loads(redis_results[0]), dtype=np.float32)
                 action_hand_left_raw = json.loads(redis_results[1])
                 action_hand_right_raw = json.loads(redis_results[2])
+
+                future_raw = None
+                if self.use_future_motion:
+                    future_raw = parse_future_raw(
+                        redis_results[4], redis_results[5], redis_results[6],
+                        cfg.NUM_FUTURE_STEPS, self.num_actions,
+                    )
 
                 if self.body_smoother is not None:
                     action_mimic = self.body_smoother.smooth(action_mimic)
@@ -516,7 +573,7 @@ class RealTimePolicyController(object):
 
                 obs_buf = self.compute_observation(
                     dof_pos, dof_vel, ang_vel, rpy, action_mimic,
-                    ref_root_xy_w=ref_root_xy_w,
+                    ref_root_xy_w=ref_root_xy_w, future_raw=future_raw,
                 )
 
                 obs_tensor = torch.from_numpy(obs_buf).float().unsqueeze(0).to(self.device)
@@ -614,6 +671,11 @@ def main():
                         help='Append diff_body_pos_b observation (33 bodies * 3 = 99 dims).')
     parser.add_argument('--use_diff_body_tannorm', action='store_true',
                         help='Append diff_body_tannorm_b observation (33 bodies * 6 = 198 dims).')
+    parser.add_argument('--use_future_motion', action='store_true',
+                        help='Append future_motion_pos_h (T*33*3=990) and '
+                             'future_motion_anchor (T*6=60) observations. Requires the '
+                             'motion server to publish future frames and is meaningful '
+                             'only with --update_robot_w_odom (world-frame anchoring).')
     parser.add_argument('--kp_scale', type=float, default=1.0,
                         help='Scale factor applied to cfg.STIFFNESS (hardware PD kps).')
     parser.add_argument('--kd_scale', type=float, default=1.0,
@@ -649,6 +711,7 @@ def main():
     print(f"  Smooth body: {args.smooth_body}")
     print(f"  use_diff_body_pos: {args.use_diff_body_pos}")
     print(f"  use_diff_body_tannorm: {args.use_diff_body_tannorm}")
+    print(f"  use_future_motion: {args.use_future_motion}")
     print(f"  Kp scale: {args.kp_scale}")
     print(f"  Kd scale: {args.kd_scale}")
 
@@ -671,6 +734,7 @@ def main():
         xml_file=args.xml,
         use_diff_body_pos=args.use_diff_body_pos,
         use_diff_body_tannorm=args.use_diff_body_tannorm,
+        use_future_motion=args.use_future_motion,
         kp_scale=args.kp_scale,
         kd_scale=args.kd_scale,
         update_robot_w_odom=args.update_robot_w_odom,

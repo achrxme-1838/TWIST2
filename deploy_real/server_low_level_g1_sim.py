@@ -19,6 +19,8 @@ from cfg import g1_29dof_cfg as cfg
 from observations import (
     compute_diff_body_pos_b,
     compute_diff_body_tannorm_b,
+    compute_future_motion_obs,
+    parse_future_raw,
 )
 from safety import SafetyController
 from utils.math import yaw_from_quat
@@ -99,6 +101,7 @@ class RealTimePolicyController:
                  policy_frequency=50,
                  use_diff_body_pos=False,
                  use_diff_body_tannorm=False,
+                 use_future_motion=False,
                  smooth_action=0.0,
                  kp_scale=1.0,
                  kd_scale=1.0,
@@ -200,11 +203,18 @@ class RealTimePolicyController:
             self.history_len * self._diff_body_tannorm_per_step if use_diff_body_tannorm else 0
         )
 
+        # Future-motion terms (no history): future_motion_pos_h + future_motion_anchor.
+        self.use_future_motion = use_future_motion
+        self._future_motion_pos_total = cfg.FUTURE_MOTION_POS_DIM if use_future_motion else 0
+        self._future_motion_anchor_total = cfg.FUTURE_MOTION_ANCHOR_DIM if use_future_motion else 0
+
         self.total_obs_size = (
             self.history_len * sum(self._hist_dims.values())
             + self._mimic_dim
             + self._diff_body_pos_total
             + self._diff_body_tannorm_total
+            + self._future_motion_pos_total
+            + self._future_motion_anchor_total
         )
 
         # Body-id caches for FK-based diff terms.
@@ -221,6 +231,10 @@ class RealTimePolicyController:
         self.ref_data = (
             mujoco.MjData(self.model)
             if (use_diff_body_pos or use_diff_body_tannorm) else None
+        )
+        # Dedicated MjData for FK on the future reference frames (future_motion_pos_h).
+        self.future_ref_data = (
+            mujoco.MjData(self.model) if use_future_motion else None
         )
 
         # Per-term ring buffers (zero-init mimics IsaacLab CircularBuffer first-push fill).
@@ -255,6 +269,9 @@ class RealTimePolicyController:
             print(f"  diff_body_pos_b: history={self.history_len} x dim={self._diff_body_pos_per_step} = {self._diff_body_pos_total}")
         if use_diff_body_tannorm:
             print(f"  diff_body_tannorm_b: history={self.history_len} x dim={self._diff_body_tannorm_per_step} = {self._diff_body_tannorm_total}")
+        if use_future_motion:
+            print(f"  future_motion_pos_h (no history): {self._future_motion_pos_total}")
+            print(f"  future_motion_anchor (no history): {self._future_motion_anchor_total}")
         print(f"  total_obs_size: {self.total_obs_size}")
 
         # ----- odom-based world-root tracking for diff_body_* terms -----
@@ -342,8 +359,19 @@ class RealTimePolicyController:
             self._ref_origin_xy = ref_xy.copy()
         return ref_xy - self._ref_origin_xy + self._odom_origin_xy
 
+    def _anchor_delta_xy(self):
+        """xy translation mapping the published motion frame -> robot world frame.
+
+        Equal to ``odom_origin_xy - ref_origin_xy`` once latched at motion start;
+        the same constant offset the odom diff_body terms apply. Used to place the
+        published future reference frames into the robot world frame. Returns None
+        until the anchor has latched (callers then skip the shift)."""
+        if self._odom_origin_xy is not None and self._ref_origin_xy is not None:
+            return self._odom_origin_xy - self._ref_origin_xy
+        return None
+
     def compute_observation(self, dof_pos, dof_vel, ang_vel, rpy, action_mimic,
-                            ref_root_xy_w=None):
+                            ref_root_xy_w=None, future_raw=None):
         """Build the flat observation tensor in PolicyCfg term-major order.
 
         dof_pos / dof_vel come in SDK order; permuted to Isaac order before the
@@ -379,7 +407,7 @@ class RealTimePolicyController:
             diff = compute_diff_body_pos_b(
                 self.model, self.data, self.ref_data, action_mimic,
                 self.tracked_body_ids, self.extended_parent_ids, self.extended_local_offsets,
-                self.num_actions, use_pb=True,
+                self.num_actions, use_pb=False,
                 update_robot_w_odom=odom_on,
                 ref_root_xy_w=ref_root_xy_w,
             )
@@ -406,6 +434,32 @@ class RealTimePolicyController:
             )
             self._diff_body_tannorm_hist.append(diff)
             flat_parts.append(np.asarray(self._diff_body_tannorm_hist, dtype=np.float32).reshape(-1))
+
+        if self.use_future_motion:
+            # Robot world root is MuJoCo GT in sim.
+            pos_h, anchor = compute_future_motion_obs(
+                self.model, self.future_ref_data,
+                cfg.NUM_FUTURE_STEPS, self.num_actions,
+                self.tracked_body_ids, self.extended_parent_ids, self.extended_local_offsets,
+                self.data.qpos[:3].copy(), self.data.qpos[3:7].copy(),
+                future_raw=future_raw,
+                anchor_delta_xy=self._anchor_delta_xy() if odom_on else None,
+                fallback_action_mimic=action_mimic,
+                fallback_root_xy=ref_root_xy_w,
+            )
+            flat_parts.append(pos_h)
+            flat_parts.append(anchor)
+            # diag (~0.5s cadence): future real-vs-fallback + pelvis future progression
+            # in the robot heading frame. For forward walking pelvis x should grow
+            # +5 -> +50; all-zero/non-progressing hints at fallback or a bad anchor.
+            self._fut_log_i = getattr(self, "_fut_log_i", 0) + 1
+            if self._fut_log_i % 25 == 0:
+                ph = pos_h.reshape(cfg.NUM_FUTURE_STEPS, cfg.NUM_TRACKED_BODIES, 3)
+                delta = self._anchor_delta_xy() if odom_on else None
+                mode = "REAL" if future_raw is not None else "fallback"
+                print(f"[future] {mode} delta={None if delta is None else np.round(delta,3)} "
+                      f"pelvis@+5={np.round(ph[0,0],3)} pelvis@+50={np.round(ph[-1,0],3)} "
+                      f"|pos_h|max={np.abs(pos_h).max():.2f}")
 
         obs_buf = np.concatenate(flat_parts)
         assert obs_buf.shape[0] == self.total_obs_size, \
@@ -479,10 +533,23 @@ class RealTimePolicyController:
                         "action_hand_right_unitree_g1_with_hands",
                         "action_neck_unitree_g1_with_hands",
                     ]
+                    if self.use_future_motion:
+                        keys += [
+                            f"{cfg.FUTURE_MOTION_ROOT_POS_KEY}_{self.robot}",
+                            f"{cfg.FUTURE_MOTION_ROOT_ROT_KEY}_{self.robot}",
+                            f"{cfg.FUTURE_MOTION_DOF_POS_KEY}_{self.robot}",
+                        ]
                     for key in keys:
                         self.redis_pipeline.get(key)
                     redis_results = self.redis_pipeline.execute()
                     action_mimic = np.asarray(json.loads(redis_results[0]), dtype=np.float32)
+
+                    future_raw = None
+                    if self.use_future_motion:
+                        future_raw = parse_future_raw(
+                            redis_results[4], redis_results[5], redis_results[6],
+                            cfg.NUM_FUTURE_STEPS, self.num_actions,
+                        )
 
                     # Odom world-root tracking. In sim the robot world root is GT
                     # (data.qpos); publish it to the ROS odom topic so the same
@@ -496,7 +563,7 @@ class RealTimePolicyController:
 
                     obs_buf = self.compute_observation(
                         dof_pos, dof_vel, ang_vel, rpy, action_mimic,
-                        ref_root_xy_w=ref_root_xy_w,
+                        ref_root_xy_w=ref_root_xy_w, future_raw=future_raw,
                     )
 
                     obs_tensor = torch.from_numpy(obs_buf).float().unsqueeze(0).to(self.device)
@@ -615,6 +682,11 @@ def main():
                         help="Append diff_body_pos_b observation (33 bodies * 3 = 99 dims).")
     parser.add_argument("--use_diff_body_tannorm", action="store_true",
                         help="Append diff_body_tannorm_b observation (33 bodies * 6 = 198 dims).")
+    parser.add_argument("--use_future_motion", action="store_true",
+                        help="Append future_motion_pos_h (T*33*3=990) and "
+                             "future_motion_anchor (T*6=60) observations. Requires the "
+                             "motion server to publish future frames and is meaningful "
+                             "only with --update_robot_w_odom (world-frame anchoring).")
     parser.add_argument("--smooth_action", type=float, default=0.0,
                         help="EMA alpha for smoothing the policy's OUTPUT action (motor command). "
                              "0 disables (default). Smaller alpha = stronger smoothing but more lag. "
@@ -661,6 +733,7 @@ def main():
         policy_frequency=args.policy_frequency,
         use_diff_body_pos=args.use_diff_body_pos,
         use_diff_body_tannorm=args.use_diff_body_tannorm,
+        use_future_motion=args.use_future_motion,
         smooth_action=args.smooth_action,
         kp_scale=args.kp_scale,
         kd_scale=args.kd_scale,
