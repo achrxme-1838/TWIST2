@@ -2,16 +2,20 @@ import numpy as np
 
 DEFAULT_MIMIC_OBS_G1 = np.concatenate([
                     np.array([0, 0]), # xy velocity (root-local)
-                    np.array([0.8]), # z position
+                    np.array([0.793]), # z position (root height at the DEFAULT_DOF_POS stand)
                     np.array([0, 0]), # roll/pitch
                     np.array([0]), # yaw (in robot's start-heading frame)
                     np.array([0, 0, 0]), # full angular velocity (root-local)
-                    # 29 dof
-                    np.array([-0.2, 0.0, 0.0, 0.4, -0.2, 0.0,  # left leg (6)
-                            -0.2, 0.0, 0.0, 0.4, -0.2, 0.0,  # right leg (6)
-                            0.0, 0.0, 0.0, # torso (1)
-                            0.0, 0.4, 0.0, 1.2, 0.0, 0.0, 0.0, # left arm (7)
-                            0.0, -0.4, 0.0, 1.2, 0.0, 0.0, 0.0, # right arm (7)
+                    # 29 dof -- mirror cfg.DEFAULT_DOF_POS (the robot PD rest pose / training
+                    # init). Keeping the idle reference == the action=0 equilibrium pose makes
+                    # the idle tracking error ~0, avoiding the idle chatter seen when the
+                    # reference asked for a different pose (knee 0.4 vs 0.669, elbow 1.2 vs 0.6)
+                    # than where the robot physically rests.
+                    np.array([-0.312, 0.0, 0.0, 0.669, -0.363, 0.0,  # left leg (6)
+                            -0.312, 0.0, 0.0, 0.669, -0.363, 0.0,  # right leg (6)
+                            0.0, 0.0, 0.0, # waist yaw/roll/pitch (3)
+                            0.2, 0.2, 0.0, 0.6, 0.0, 0.0, 0.0, # left arm (7)
+                            0.2, -0.2, 0.0, 0.6, 0.0, 0.0, 0.0, # right arm (7)
                         ])
                 ])
 
