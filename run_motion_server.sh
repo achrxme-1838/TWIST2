@@ -37,7 +37,7 @@ script_dir=$(dirname $(realpath $0))
 # Squatting
 # motion_file="${script_dir}/assets/example_motions/A6_lift_box_poses.pkl"  # 5 / 0 (speed 1.0 is recommended)
 # motion_file="${script_dir}/assets/MAPO_demo/22_19_poses.pkl"  # sitting (speed 1.0 is recommended)
-# motion_file="${script_dir}/assets/MAPO_demo/Subject_69_F_21_poses.pkl"  # LIL DANGER!! (MUST speed 2.0) [FIG motion]
+motion_file="${script_dir}/assets/MAPO_demo/Subject_69_F_21_poses.pkl"  # LIL DANGER!! (MUST speed 2.0) [FIG motion]
 
 # Walking farward
 # motion_file="${script_dir}/assets/example_motions/B3-walk1_poses.pkl"  # 5 / 0 (speed 0.5 is recommended)
@@ -61,7 +61,7 @@ script_dir=$(dirname $(realpath $0))
 
 
 ###
-motion_file="${script_dir}/assets/MAPO_demo2/G2-Sidekick-leading-left_poses.pkl"
+# motion_file="${script_dir}/assets/MAPO_demo2/G2-Sidekick-leading-left_poses.pkl"
 
 
 

@@ -42,36 +42,57 @@ ANKLE_JOINT_NAMES = (
     "left_ankle_roll_joint",  "right_ankle_roll_joint",
 )
 
-# Robot init pose (SDK order).
+# Robot init pose (SDK order). Mirrors g1_29dof_beyond_mimic_cfg init_state.joint_pos.
+# Used as the JointPositionAction default offset (use_default_offset=True) and the
+# joint_pos_rel observation reference, so it must match training exactly.
 DEFAULT_DOF_POS = np.array([
-    -0.1, 0.0, 0.0, 0.3, -0.2, 0.0,           # left leg
-    -0.1, 0.0, 0.0, 0.3, -0.2, 0.0,           # right leg
-    0.0, 0.0, 0.0,                            # torso
-    0.3, 0.25, 0.0, 0.97, 0.15, 0.0, 0.0,     # left arm
-    0.3, -0.25, 0.0, 0.97, -0.15, 0.0, 0.0,   # right arm
+    -0.312, 0.0, 0.0, 0.669, -0.363, 0.0,     # left leg
+    -0.312, 0.0, 0.0, 0.669, -0.363, 0.0,     # right leg
+    0.0, 0.0, 0.0,                            # waist yaw/roll/pitch
+    0.2, 0.2, 0.0, 0.6, 0.0, 0.0, 0.0,        # left arm
+    0.2, -0.2, 0.0, 0.6, 0.0, 0.0, 0.0,       # right arm
 ])
 
-# PD gains (ImplicitActuatorCfg stiffness/damping, SDK order).
+# PD gains mirror DEX_RL_LAB g1_29dof_beyond_mimic_cfg ImplicitActuatorCfg. They are
+# derived per-motor from armature with a 10 Hz natural frequency and damping ratio 2.0:
+#   stiffness = armature * (2*pi*10)**2,  damping = 2 * zeta * armature * (2*pi*10).
+# Feet (ankle) and waist roll/pitch use the 5020 actuator doubled (2x armature/gain).
+_ARMATURE_5020 = 0.003609725
+_ARMATURE_7520_14 = 0.010177520
+_ARMATURE_7520_22 = 0.025101925
+_ARMATURE_4010 = 0.00425
+_NATURAL_FREQ = 10 * 2.0 * 3.1415926535  # 10 Hz
+_DAMPING_RATIO = 2.0
+_stiff = lambda a: a * _NATURAL_FREQ ** 2
+_damp = lambda a: 2.0 * _DAMPING_RATIO * a * _NATURAL_FREQ
+_S5020, _S7514, _S7522, _S4010 = (_stiff(a) for a in
+    (_ARMATURE_5020, _ARMATURE_7520_14, _ARMATURE_7520_22, _ARMATURE_4010))
+_D5020, _D7514, _D7522, _D4010 = (_damp(a) for a in
+    (_ARMATURE_5020, _ARMATURE_7520_14, _ARMATURE_7520_22, _ARMATURE_4010))
+
+# (SDK order) leg: hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll.
 STIFFNESS = np.array([
-    100, 100, 100, 150, 40, 40,
-    100, 100, 100, 150, 40, 40,
-    200, 40, 40,
-    40, 40, 40, 40, 40, 40, 40,
-    40, 40, 40, 40, 40, 40, 40,
+    _S7514, _S7522, _S7514, _S7522, 2 * _S5020, 2 * _S5020,   # left leg
+    _S7514, _S7522, _S7514, _S7522, 2 * _S5020, 2 * _S5020,   # right leg
+    _S7514, 2 * _S5020, 2 * _S5020,                           # waist yaw/roll/pitch
+    _S5020, _S5020, _S5020, _S5020, _S5020, _S4010, _S4010,   # left arm
+    _S5020, _S5020, _S5020, _S5020, _S5020, _S4010, _S4010,   # right arm
 ])
 DAMPING = np.array([
-    2, 2, 2, 4, 2, 2,
-    2, 2, 2, 4, 2, 2,
-    5, 5, 5,
-    1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1,
+    _D7514, _D7522, _D7514, _D7522, 2 * _D5020, 2 * _D5020,
+    _D7514, _D7522, _D7514, _D7522, 2 * _D5020, 2 * _D5020,
+    _D7514, 2 * _D5020, 2 * _D5020,
+    _D5020, _D5020, _D5020, _D5020, _D5020, _D4010, _D4010,
+    _D5020, _D5020, _D5020, _D5020, _D5020, _D4010, _D4010,
 ])
 
-# Effort limits: wrist pitch/yaw use W4010-25 (5 Nm), rest of arm N5020-16 (25 Nm).
+# effort_limit_sim from g1_29dof_beyond_mimic_cfg (SDK order). Feet + waist roll/pitch
+# = 50 Nm, waist_yaw/hip_yaw/hip_pitch = 88, hip_roll/knee = 139, arm = 25 except
+# wrist pitch/yaw (W4010-25) = 5 Nm.
 TORQUE_LIMITS = np.array([
-    88, 139, 88, 139, 25, 25,
-    88, 139, 88, 139, 25, 25,
-    88, 25, 25,
+    88, 139, 88, 139, 50, 50,
+    88, 139, 88, 139, 50, 50,
+    88, 50, 50,
     25, 25, 25, 25, 25, 5, 5,
     25, 25, 25, 25, 25, 5, 5,
 ])
