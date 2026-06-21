@@ -496,6 +496,17 @@ class RealTimePolicyController:
         self.redis_pipeline.set("action_neck_unitree_g1_with_hands", json.dumps(np.zeros(2).tolist()))
         self.redis_pipeline.execute()
 
+        # Drop any stale future-motion frames left in Redis by a previous motion
+        # run so we start on the stationary fallback (default pose) instead of
+        # chasing the previous motion's trajectory. Only the new future keys are
+        # cleared -- the diff_body-shared ref_root_world/epoch are left untouched.
+        if self.use_future_motion and self.redis_client is not None:
+            self.redis_client.delete(
+                f"{cfg.FUTURE_MOTION_ROOT_POS_KEY}_{self.robot}",
+                f"{cfg.FUTURE_MOTION_ROOT_ROT_KEY}_{self.robot}",
+                f"{cfg.FUTURE_MOTION_DOF_POS_KEY}_{self.robot}",
+            )
+
         measure_fps = self.measure_fps
         fps_measurements = []
         fps_iteration_count = 0

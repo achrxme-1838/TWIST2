@@ -14,8 +14,8 @@
 
 SCRIPT_DIR=$(dirname $(realpath $0))
 # ckpt_path=${SCRIPT_DIR}/assets/ckpts/test/260613.onnx
-# ckpt_path=${SCRIPT_DIR}/assets/ckpts/2_MAPO_wo_fix_260616.onnx
 ckpt_path=${SCRIPT_DIR}/assets/ckpts/3_MAPO_add_future_260718.onnx
+# ckpt_path=${SCRIPT_DIR}/assets/ckpts/3_MAPO_bm_cfg.onnx
 
 
 # ---- env: conda twist2_ros (rclpy + mujoco/onnx/torch) + ROS2 Humble ----

@@ -512,6 +512,14 @@ def main(args, xml_file, robot_base):
         exit()
     finally:
         print("[Motion Server] Exiting...Interpolating to default mimic_obs...")
+        # Drop this motion's future-motion frames so they don't bleed into the next
+        # motion (the controller falls back to a stationary future = the default
+        # pose it interpolates to below). ref_root_world/epoch are left as-is.
+        redis_client.delete(
+            f"{cfg.FUTURE_MOTION_ROOT_POS_KEY}_{args.robot}",
+            f"{cfg.FUTURE_MOTION_ROOT_ROT_KEY}_{args.robot}",
+            f"{cfg.FUTURE_MOTION_DOF_POS_KEY}_{args.robot}",
+        )
         # do linear interpolation to the last mimic_obs
         time_back_to_default = 2.0
         target_mimic_obs = start_frame_mimic_obs if args.send_start_frame_as_end_frame and start_frame_mimic_obs is not None else DEFAULT_MIMIC_OBS[args.robot]

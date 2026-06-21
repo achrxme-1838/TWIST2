@@ -2,7 +2,7 @@
 
 script_dir=$(dirname $(realpath $0))
 
-motion_file="${script_dir}/assets/example_motions/A1-Stand_poses.pkl"
+# motion_file="${script_dir}/assets/example_motions/A1-Stand_poses.pkl"
 
 #### Motion Class (suc / fail)
 # Standing 
@@ -58,6 +58,11 @@ motion_file="${script_dir}/assets/example_motions/A1-Stand_poses.pkl"
 # motion_file="${script_dir}/assets/example_motions/A6-lift_box_t2_poses.pkl"  # 5 / 0
 # motion_file="${script_dir}/assets/MAPO_demo/step_over_gap08_poses.pkl"  # 3 / 0 (speed 1.0 recommended)
 # motion_file="${script_dir}/assets/MAPO_demo/0016_sitting2_poses.pkl"  #  (speed 0.5 / 200~ step is recommended)
+
+
+###
+motion_file="${script_dir}/assets/MAPO_demo2/G2-Sidekick-leading-left_poses.pkl"
+
 
 
 
