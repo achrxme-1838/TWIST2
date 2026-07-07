@@ -15,7 +15,7 @@
 SCRIPT_DIR=$(dirname $(realpath $0))
 # ckpt_path=${SCRIPT_DIR}/assets/ckpts/test/260613.onnx
 # ckpt_path=${SCRIPT_DIR}/assets/ckpts/3_MAPO_add_future_260718.onnx
-ckpt_path=${SCRIPT_DIR}/assets/ckpts/3_MAPO_bm_cfg.onnx
+ckpt_path=${SCRIPT_DIR}/assets/ckpts/3_MAPO_HuB_260707.onnx
 
 
 # ---- env: conda twist2_ros (rclpy + mujoco/onnx/torch) + ROS2 Humble ----
@@ -36,8 +36,8 @@ python server_low_level_g1_sim.py \
     --limit_fps 1 \
     --use_diff_body_pos \
     --use_diff_body_tannorm \
-    --use_future_motion \
     --update_robot_w_odom \
+    --use_future_motion \
     --odom_topic /twist2/sim_odom \
     --kp_scale 1.0 \
     --kd_scale 1.0 \
