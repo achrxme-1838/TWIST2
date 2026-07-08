@@ -291,6 +291,7 @@ class RealTimePolicyController(object):
         self._motion_epoch = None      # last seen motion epoch (new motion -> reset)
         self._odom_origin_xy = None    # robot world xy at motion start
         self._ref_origin_xy = None     # reference motion root xy at motion start
+        self._idle_anchor_xy = None    # world-fixed idle ref xy (no motion published)
         if self.update_robot_w_odom:
             from ros_odom import OdomSubscriber
             self.odom_sub = OdomSubscriber(self.odom_topic)
@@ -359,8 +360,19 @@ class RealTimePolicyController(object):
             self._ref_origin_xy = None
 
         if ref_xy is None:
-            # Ref root not published yet: pin ref root to the current robot root.
-            return np.asarray(robot_root_xy, dtype=np.float64).copy()
+            # No reference published (idle): hold a WORLD-FIXED anchor latched at
+            # the robot's root, instead of pinning the ref to the robot every
+            # tick. Per-tick pinning zeroes the xy of diff_body/future obs, which
+            # opens the policy's translation feedback loop and makes it rattle
+            # in place (idle jitter). Re-latch only if the robot ends up far from
+            # the anchor (carried away / odom jump) so it never tries to walk
+            # back a long distance.
+            robot_xy = np.asarray(robot_root_xy, dtype=np.float64)
+            if (self._idle_anchor_xy is None
+                    or np.linalg.norm(robot_xy - self._idle_anchor_xy) > 0.5):
+                self._idle_anchor_xy = robot_xy.copy()
+            return self._idle_anchor_xy.copy()
+        self._idle_anchor_xy = None
 
         if self._odom_origin_xy is None:
             self._odom_origin_xy = np.asarray(robot_root_xy, dtype=np.float64).copy()

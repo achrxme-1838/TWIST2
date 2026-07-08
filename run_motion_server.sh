@@ -61,8 +61,8 @@ script_dir=$(dirname $(realpath $0))
 
 
 ###
-motion_file="${script_dir}/assets/MAPO_demo2/G2-Sidekick-leading-left_poses.pkl"
-# motion_file="${script_dir}/assets/MAPO_demo2/G6-axe-kick_poses.pkl"
+# motion_file="${script_dir}/assets/MAPO_demo2/G2-Sidekick-leading-left_poses.pkl"
+motion_file="${script_dir}/assets/MAPO_demo2/G6-axe-kick_poses.pkl"
 # motion_file="${script_dir}/assets/example_motions/A1-Stand_poses.pkl"
 # motion_file="${script_dir}/assets/example_motions/B3-walk1_poses.pkl"
 # motion_file="${script_dir}/assets/MAPO_demo/Subject_69_F_21_poses.pkl"
