@@ -8,7 +8,7 @@ cmu_fbx_all/
 *zip
 *ipynb
 npy
-pkl
+*.pkl
 phc/
 
 motion_data/

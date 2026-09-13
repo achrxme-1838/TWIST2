@@ -5,7 +5,10 @@ import redis
 import json
 from typing import Optional
 import numpy as np
-import isaacgym
+try:
+    import isaacgym  # noqa: F401  (must precede torch when present; not needed for playback)
+except ImportError:
+    pass
 import torch
 from rich import print
 import os

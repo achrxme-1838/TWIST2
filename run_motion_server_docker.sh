@@ -59,22 +59,25 @@ script_dir=$(dirname $(realpath $0))
 # motion_file="${script_dir}/assets/MAPO_demo/step_over_gap08_poses.pkl"  # 3 / 0 (speed 1.0 recommended)
 # motion_file="${script_dir}/assets/MAPO_demo/0016_sitting2_poses.pkl"  #  (speed 0.5 / 200~ step is recommended)
 
-
-# PHUMA (single-motion pkl; slice one out of a DEX_RL_LAB integrated dataset first):
-#   python deploy_real/extract_motion_pkl.py <PHUMA_xxx.pkl> --list --grep <substring>
-#   python deploy_real/extract_motion_pkl.py <PHUMA_xxx.pkl> --name <key> --out assets/phuma/<key>.pkl
-# PHUMA motions carry no local_body_pos, so --motion_height_adjust is not supported for them.
+### PHUMA
 # motion_file="${script_dir}/assets/phuma/LAFAN1_fallAndGetUp1_subject1_chunk_0034.pkl"
 
 ###
 # motion_file="${script_dir}/assets/MAPO_demo2/G2-Sidekick-leading-left_poses.pkl"
-motion_file="${script_dir}/assets/MAPO_demo2/G6-axe-kick_poses.pkl"
+# motion_file="${script_dir}/assets/MAPO_demo2/G6-axe-kick_poses.pkl"
 # motion_file="${script_dir}/assets/example_motions/A1-Stand_poses.pkl"
 # motion_file="${script_dir}/assets/example_motions/B3-walk1_poses.pkl"
 # motion_file="${script_dir}/assets/MAPO_demo/Subject_69_F_21_poses.pkl"
 
+### TEST
+motion_file="${script_dir}/assets/test/A1-Stand_poses.pkl"
 
 
+# Container (Isaac Sim python) -- no conda/isaacgym needed for playback.
+PY=/workspace/isaaclab/_isaac_sim/python.sh
+export PYTHONNOUSERSITE=1
+unset PYTHONPATH
+redis-cli ping >/dev/null 2>&1 || redis-server --daemonize yes --bind 127.0.0.1 --save "" --appendonly no
 
 # Change to deploy_real directory
 cd deploy_real
@@ -86,16 +89,16 @@ redis_ip="localhost"
 
 
 # Run the motion server
-python server_motion_lib.py \
+"$PY" server_motion_lib.py \
     --motion_file ${motion_file} \
     --robot unitree_g1_with_hands \
-    --vis \
     --redis_ip ${redis_ip} \
     --steps 5 \
     --blend_in_time 1.0 \
     --playback_speed 1.0 \
     --max_step 2000 \
 
+    # --vis \                # MuJoCo viewer of the reference motion; needs a display (not in the headless container)
     # --fix_root_heading \
     # --fix_root_pos \
 

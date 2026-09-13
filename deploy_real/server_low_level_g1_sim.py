@@ -1,8 +1,14 @@
 import argparse
 import json
+import sys
 import time
 import os
 from collections import deque
+
+# --headless renders offscreen; MuJoCo picks its GL backend at import time, so
+# the env var has to be set before `import mujoco`.
+if "--headless" in sys.argv:
+    os.environ.setdefault("MUJOCO_GL", "egl")
 
 import numpy as np
 import redis
@@ -22,7 +28,7 @@ from observations import (
     compute_future_motion_obs,
     parse_future_raw,
 )
-from safety import SafetyController
+from safety import SafetyController, StdinKeyListener
 from utils.math import yaw_from_quat
 
 try:
@@ -108,6 +114,10 @@ class RealTimePolicyController:
                  update_robot_w_odom=False,
                  odom_topic="/twist2/sim_odom",
                  robot="unitree_g1_with_hands",
+                 headless=False,
+                 video_path="twist2_simulation.mp4",
+                 video_size=(640, 480),
+                 sim_duration=100000.0,
                  ):
         self.measure_fps = measure_fps
         self.limit_fps = limit_fps
@@ -129,19 +139,39 @@ class RealTimePolicyController:
 
         # self.safety = SafetyController(initial_scale=0.5)
         self.safety = SafetyController(initial_scale=1.0)
-        self.viewer = mjv.launch_passive(
-            self.model, self.data,
-            key_callback=self.safety.handle_keycode,
-            show_left_ui=False, show_right_ui=False,
-        )
-        self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = 0
-        self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = 0
-        self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = 0
-        self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_COM] = 0
-        self.viewer.cam.distance = 2.0
+        self.headless = headless
+        self.video_path = video_path
+        self.video_size = tuple(video_size)
+        self.viewer = None
+        self.renderer = None      # offscreen renderer (headless + record_video)
+        self.render_cam = None
+        self.key_listener = None  # stdin keys stand in for the viewer key callback
+        if not headless:
+            self.viewer = mjv.launch_passive(
+                self.model, self.data,
+                key_callback=self.safety.handle_keycode,
+                show_left_ui=False, show_right_ui=False,
+            )
+            self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = 0
+            self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = 0
+            self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = 0
+            self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_COM] = 0
+            self.viewer.cam.distance = 2.0
+        else:
+            print(f"[headless] no viewer (MUJOCO_GL={os.environ.get('MUJOCO_GL')}); "
+                  f"{'recording to ' + video_path if record_video else 'no video'}")
+            if record_video:
+                w, h = self.video_size
+                self.renderer = mujoco.Renderer(self.model, height=h, width=w)
+                self.render_cam = mujoco.MjvCamera()
+                self.render_cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+                self.render_cam.distance = 2.0
+                self.render_cam.azimuth = 90.0
+                self.render_cam.elevation = -20.0
+            self.key_listener = StdinKeyListener(self.safety.handle_keycode)
 
         self.num_actions = cfg.NUM_ACTIONS
-        self.sim_duration = 100000.0
+        self.sim_duration = float(sim_duration)
         self.sim_dt = 0.001
         self.sim_decimation = 1 / (policy_frequency * self.sim_dt)
         print(f"sim_decimation: {self.sim_decimation}")
@@ -483,9 +513,12 @@ class RealTimePolicyController:
 
         if self.record_video:
             import imageio
-            mp4_writer = imageio.get_writer('twist2_simulation.mp4', fps=30)
+            video_fps = 1.0 / (self.sim_decimation * self.sim_dt)  # one frame per policy step
+            mp4_writer = imageio.get_writer(self.video_path, fps=video_fps)
         else:
             mp4_writer = None
+        if self.key_listener is not None:
+            self.key_listener.start()
 
         self.reset_sim()
         self.reset(self.mujoco_default_dof_pos)
@@ -636,12 +669,15 @@ class RealTimePolicyController:
                     pd_target = pd_target_isaac[self.isaac_to_sdk]
 
                     pelvis_pos = self.data.xpos[self.model.body("pelvis").id]
-                    self.viewer.cam.lookat = pelvis_pos
-                    self.viewer.sync()
-
-                    if mp4_writer is not None:
-                        img = self.viewer.read_pixels()
-                        mp4_writer.append_data(img)
+                    if self.viewer is not None:
+                        self.viewer.cam.lookat = pelvis_pos
+                        self.viewer.sync()
+                        if mp4_writer is not None:
+                            mp4_writer.append_data(self.viewer.read_pixels())
+                    elif self.renderer is not None:
+                        self.render_cam.lookat[:] = pelvis_pos
+                        self.renderer.update_scene(self.data, camera=self.render_cam)
+                        mp4_writer.append_data(self.renderer.render())
 
                     if self.record_proprio:
                         self.proprio_recordings.append({
@@ -675,7 +711,7 @@ class RealTimePolicyController:
         finally:
             if mp4_writer is not None:
                 mp4_writer.close()
-                print("Video saved as twist2_simulation.mp4")
+                print(f"Video saved as {self.video_path}")
 
             if self.record_proprio and self.proprio_recordings:
                 import pickle
@@ -683,6 +719,10 @@ class RealTimePolicyController:
                     pickle.dump(self.proprio_recordings, f)
                 print("Proprioceptive recordings saved as twist2_proprio_recordings.pkl")
 
+            if self.key_listener is not None:
+                self.key_listener.stop()
+            if self.renderer is not None:
+                self.renderer.close()
             if self.viewer:
                 self.viewer.close()
             print("Simulation finished.")
@@ -697,6 +737,15 @@ def main():
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to run policy on (cuda/cpu)')
     parser.add_argument('--record_video', action='store_true', help='Record video of simulation')
+    parser.add_argument('--headless', action='store_true',
+                        help='No MuJoCo viewer (sets MUJOCO_GL=egl). With --record_video the '
+                             'frames are rendered offscreen; safety keys are read from stdin.')
+    parser.add_argument('--video_path', type=str, default='twist2_simulation.mp4',
+                        help='Output mp4 for --record_video.')
+    parser.add_argument('--video_size', type=int, nargs=2, default=(640, 480), metavar=('W', 'H'),
+                        help='Offscreen render size for --headless --record_video.')
+    parser.add_argument('--sim_duration', type=float, default=100000.0,
+                        help='Stop after this many simulated seconds (default: effectively unbounded).')
     parser.add_argument('--record_proprio', action='store_true', help='Record proprioceptive data')
     parser.add_argument("--measure_fps", help="Measure FPS", default=0, type=int)
     parser.add_argument("--limit_fps", help="Limit FPS with sleep", default=1, type=int)
@@ -739,7 +788,9 @@ def main():
     print(f"  XML file: {args.xml}")
     print(f"  Policy file: {args.policy}")
     print(f"  Device: {args.device}")
-    print(f"  Record video: {args.record_video}")
+    print(f"  Record video: {args.record_video}" + (f" -> {args.video_path}" if args.record_video else ""))
+    print(f"  Headless: {args.headless}")
+    print(f"  Sim duration: {args.sim_duration}s")
     print(f"  Record proprio: {args.record_proprio}")
     print(f"  Measure FPS: {args.measure_fps}")
     print(f"  Limit FPS: {args.limit_fps}")
@@ -762,6 +813,10 @@ def main():
         kd_scale=args.kd_scale,
         update_robot_w_odom=args.update_robot_w_odom,
         odom_topic=args.odom_topic,
+        headless=args.headless,
+        video_path=args.video_path,
+        video_size=tuple(args.video_size),
+        sim_duration=args.sim_duration,
     )
     controller.run()
 

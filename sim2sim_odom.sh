@@ -41,4 +41,3 @@ python server_low_level_g1_sim.py \
     --odom_topic /twist2/sim_odom \
     --kp_scale 1.0 \
     --kd_scale 1.0 \
-
