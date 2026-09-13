@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import os, pickle, yaml
+from typing import Optional, Tuple
 import torch
 from pose.utils.torch_utils import quat_diff, quat_to_exp_map, slerp, euler_from_quaternion
 from tqdm import tqdm
@@ -53,8 +56,61 @@ class MotionLib:
         
         # load motions
         self._load_motions(motion_file)
-        
-        
+
+    @staticmethod
+    def _detect_motion_format(motion_data) -> Optional[str]:
+        if not isinstance(motion_data, dict):
+            return None
+        if "root_pos" in motion_data and "root_rot" in motion_data and "dof_pos" in motion_data:
+            return "GMR"
+        if "root_trans" in motion_data and "root_ori" in motion_data and "dof_pos" in motion_data:
+            return "PHUMA"
+        return None
+
+    @staticmethod
+    def _resolve_motion_entry(loaded_data, source_path: str) -> Tuple[dict, str, str]:
+        """Return (motion_dict, format, name) for a single-motion pkl."""
+        stem = os.path.splitext(os.path.basename(source_path))[0]
+        motion_format = MotionLib._detect_motion_format(loaded_data)
+        if motion_format is not None:
+            return loaded_data, motion_format, stem
+
+        if isinstance(loaded_data, dict) and len(loaded_data) == 1:
+            name, entry = next(iter(loaded_data.items()))
+            motion_format = MotionLib._detect_motion_format(entry)
+            if motion_format is not None:
+                return entry, motion_format, str(name)
+
+        keys = list(loaded_data.keys())[:10] if isinstance(loaded_data, dict) else type(loaded_data).__name__
+        raise ValueError(
+            f"Unsupported motion data format (expected a single GMR/PHUMA motion). "
+            f"source={source_path}, keys={keys}"
+        )
+
+    def _extract_motion_arrays(self, entry: dict, motion_format: str):
+        """Pull (fps, root_pos, root_rot, dof_pos, local_body_pos, link_body_list) out of a
+        motion dict using the key names of its format. local_body_pos / link_body_list are
+        None for PHUMA."""
+        root_pos_key = "root_trans" if motion_format == "PHUMA" else "root_pos"
+        root_rot_key = "root_ori" if motion_format == "PHUMA" else "root_rot"
+
+        fps = float(entry["fps"])
+        root_pos = torch.tensor(np.asarray(entry[root_pos_key]), dtype=torch.float, device=self._device)
+        root_rot = torch.tensor(np.asarray(entry[root_rot_key]), dtype=torch.float, device=self._device)
+        dof_pos = torch.tensor(np.asarray(entry["dof_pos"]), dtype=torch.float, device=self._device)
+        if dof_pos.ndim == 3 and dof_pos.shape[-1] == 1:
+            dof_pos = dof_pos.squeeze(-1)
+
+        # Recenter so the trajectory starts at the world-xy origin (as the training loader
+        # does). PHUMA clips can store large absolute world xy.
+        root_pos[:, :2] -= root_pos[0:1, :2].clone()
+
+        local_body_pos = entry.get("local_body_pos")
+        if local_body_pos is not None:
+            local_body_pos = torch.tensor(np.asarray(local_body_pos), dtype=torch.float, device=self._device)
+        link_body_list = entry.get("link_body_list")
+        return fps, root_pos, root_rot, dof_pos, local_body_pos, link_body_list
+
     def _load_motions(self, motion_file):
         self._motion_names = []
         self._motion_weights = []
@@ -96,17 +152,30 @@ class MotionLib:
             except Exception as e:
                 print(f"Error loading motion file {curr_file}: {e}")
                 continue
-            fps = motion_data["fps"]
+            try:
+                motion_entry, motion_format, motion_name = self._resolve_motion_entry(motion_data, curr_file)
+                fps, root_pos, root_rot, dof_pos, local_body_pos, link_body_list = \
+                    self._extract_motion_arrays(motion_entry, motion_format)
+            except Exception as e:
+                print(f"Error parsing motion file {curr_file}: {e}")
+                continue
             curr_weight = motion_weights[i]
-            root_pos = torch.tensor(motion_data["root_pos"], dtype=torch.float, device=self._device)
-            root_rot = torch.tensor(motion_data["root_rot"], dtype=torch.float, device=self._device)
-            dof_pos = torch.tensor(motion_data["dof_pos"], dtype=torch.float, device=self._device)
-            local_body_pos = torch.tensor(motion_data["local_body_pos"], dtype=torch.float, device=self._device)
-            if self._body_link_list is None or len(self._body_link_list) == 0:
-                self._body_link_list = motion_data["link_body_list"]
             num_frames = root_pos.shape[0]
             motion_len_s = 1.0 / fps * (num_frames - 1)
-            
+            print(f"[MotionLib] {motion_name}: format={motion_format}, frames={num_frames}, fps={fps:g}")
+
+            if local_body_pos is None:
+                # PHUMA has no body positions. Keep a (T, 1, 3) placeholder so downstream
+                # tensor concatenation / frame blending keep working (the value is unused).
+                if self._motion_height_adjust:
+                    raise ValueError(
+                        f"--motion_height_adjust needs local_body_pos, which the {motion_format} "
+                        f"motion {curr_file} does not provide."
+                    )
+                local_body_pos = torch.zeros((num_frames, 1, 3), dtype=torch.float, device=self._device)
+            elif link_body_list and (self._body_link_list is None or len(self._body_link_list) == 0):
+                self._body_link_list = link_body_list
+
             if self._motion_height_adjust:
                 # compute the lowest body part in reference motion
                 body_pos = local_body_pos + root_pos.unsqueeze(1)
@@ -115,7 +184,7 @@ class MotionLib:
                 root_pos[..., 2] -= lowest_body_part
                 
             try:
-                self._add_motions(root_pos, root_rot, dof_pos, local_body_pos, fps, curr_weight, curr_file)
+                self._add_motions(root_pos, root_rot, dof_pos, local_body_pos, fps, curr_weight, curr_file, motion_name)
             except Exception as e:
                 print(f"Error adding motion {curr_file}: {e}")
                 continue
@@ -146,10 +215,12 @@ class MotionLib:
                     sub_local_body_pos = local_body_pos[start_idx:end_idx]
                     # sub_weight = curr_weight + i # we increase the weight of the sub-motion by i
                     sub_weight = curr_weight
-                    self._add_motions(sub_root_pos, sub_root_rot, sub_dof_pos, sub_local_body_pos, fps, sub_weight, curr_file)
+                    self._add_motions(sub_root_pos, sub_root_rot, sub_dof_pos, sub_local_body_pos, fps, sub_weight, curr_file, motion_name)
                 # print(f"Decomposed {curr_file} into {num_sub_motions} sub-motions")
         
         print(f"Total number of sub-motions: {num_sub_motions_total}")
+        if len(self._motion_names) == 0:
+            raise ValueError(f"No motion could be loaded from {motion_file} (see errors above).")
                         
         assert len(self._motion_weights) == len(self._motion_names), f"len(self._motion_weights) = {len(self._motion_weights)}, len(self._motion_names) = {len(self._motion_names)}"
         assert len(self._motion_weights) == len(self._motion_files), f"len(self._motion_weights) = {len(self._motion_weights)}, len(self._motion_files) = {len(self._motion_files)}"
@@ -185,7 +256,7 @@ class MotionLib:
         total_len = self.get_total_length()
         print("Loaded {:d} motions with a total length of {:.3f}s.".format(num_motions, total_len))
 
-    def _add_motions(self, root_pos, root_rot, dof_pos, local_body_pos, fps, curr_weight, curr_file):
+    def _add_motions(self, root_pos, root_rot, dof_pos, local_body_pos, fps, curr_weight, curr_file, motion_name=None):
         dt = 1.0 / fps
         num_frames = root_pos.shape[0]
         curr_len = dt * (num_frames - 1)
@@ -228,7 +299,7 @@ class MotionLib:
         self._motion_root_rot_delta_local.append(root_rot_delta_local)
         self._motion_dof_vel.append(dof_vel)
         self._motion_local_body_pos.append(local_body_pos)
-        self._motion_names.append(os.path.basename(curr_file))
+        self._motion_names.append(motion_name if motion_name is not None else os.path.basename(curr_file))
     
     def _compute_so3_derivative(self, rotations: torch.Tensor, dt: float) -> torch.Tensor:
         """Computes the derivative of a sequence of SO3 rotations using central differences.
@@ -389,6 +460,8 @@ class MotionLib:
         return root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel, local_key_body_pos, root_pos_delta_local, root_rot_delta_local
     
     def get_key_body_idx(self, key_body_names):
+        if not self._body_link_list:
+            raise ValueError("No link_body_list available (PHUMA motions do not carry body positions).")
         key_body_idx = []
         for key_body_name in key_body_names:
             key_body_idx.append(self._body_link_list.index(key_body_name))

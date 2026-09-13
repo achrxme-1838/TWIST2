@@ -60,6 +60,12 @@ script_dir=$(dirname $(realpath $0))
 # motion_file="${script_dir}/assets/MAPO_demo/0016_sitting2_poses.pkl"  #  (speed 0.5 / 200~ step is recommended)
 
 
+# PHUMA (single-motion pkl; slice one out of a DEX_RL_LAB integrated dataset first):
+#   python deploy_real/extract_motion_pkl.py <PHUMA_xxx.pkl> --list --grep <substring>
+#   python deploy_real/extract_motion_pkl.py <PHUMA_xxx.pkl> --name <key> --out assets/phuma/<key>.pkl
+# PHUMA motions carry no local_body_pos, so --motion_height_adjust is not supported for them.
+# motion_file="${script_dir}/assets/phuma/LAFAN1_fallAndGetUp1_subject1_chunk_0034.pkl"
+
 ###
 # motion_file="${script_dir}/assets/MAPO_demo2/G2-Sidekick-leading-left_poses.pkl"
 motion_file="${script_dir}/assets/MAPO_demo2/G6-axe-kick_poses.pkl"
