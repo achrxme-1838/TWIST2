@@ -176,6 +176,42 @@ def _drive_ref_data_pose(model, ref_data, root_pos_w, root_quat_wxyz, dof_pos, n
     mujoco.mj_kinematics(model, ref_data)
 
 
+def compute_future_body_pos_w(
+    model, ref_data,
+    future_root_pos_w, future_root_quat_w, future_dof_pos,
+    tracked_body_ids, extended_parent_ids, extended_local_offsets,
+    num_actions,
+):
+    """Extended-body world positions of the T future reference frames, [T, B, 3]
+    float64. Drives ``ref_data`` with each step's (root pose, dof) and runs FK --
+    the same machinery as the diff_body terms, so the body order matches exactly."""
+    future_root_pos_w = np.asarray(future_root_pos_w, dtype=np.float64)
+    T = future_root_pos_w.shape[0]
+    num_bodies = len(tracked_body_ids) + len(extended_parent_ids)
+    body_pos_w = np.empty((T, num_bodies, 3), dtype=np.float64)
+    for t in range(T):
+        _drive_ref_data_pose(
+            model, ref_data, future_root_pos_w[t], future_root_quat_w[t],
+            future_dof_pos[t], num_actions,
+        )
+        body_pos_w[t] = compute_extended_body_pos_w(
+            ref_data, tracked_body_ids, extended_parent_ids, extended_local_offsets,
+        )
+    return body_pos_w
+
+
+def future_pos_h_from_body_pos(body_pos_w, robot_root_pos_w, robot_root_quat_w):
+    """future_motion_pos_h from precomputed future body positions [T, B, 3]:
+    heading_inv(robot) ⊗ (body_pos_w - robot_root_pos_w). Flat [T*B*3] float32."""
+    body_pos_w = np.asarray(body_pos_w, dtype=np.float64)
+    T, num_bodies = body_pos_w.shape[:2]
+    rel = body_pos_w - np.asarray(robot_root_pos_w, dtype=np.float64).reshape(1, 1, 3)
+    heading_inv = heading_quat_from_quat(robot_root_quat_w, inverse=True)  # [4]
+    heading_inv_b = np.broadcast_to(heading_inv, (T, num_bodies, 4))
+    pos_h = quat_apply(heading_inv_b, rel)  # [T, B, 3]
+    return pos_h.astype(np.float32).reshape(-1)
+
+
 def compute_future_motion_pos_h(
     model, ref_data,
     future_root_pos_w, future_root_quat_w, future_dof_pos,
@@ -200,25 +236,11 @@ def compute_future_motion_pos_h(
         robot_root_pos_w:   [3]    current robot root xyz (world).
         robot_root_quat_w:  [4]    current robot root quat (wxyz).
     """
-    future_root_pos_w = np.asarray(future_root_pos_w, dtype=np.float64)
-    T = future_root_pos_w.shape[0]
-    num_bodies = len(tracked_body_ids) + len(extended_parent_ids)
-
-    body_pos_w = np.empty((T, num_bodies, 3), dtype=np.float64)
-    for t in range(T):
-        _drive_ref_data_pose(
-            model, ref_data, future_root_pos_w[t], future_root_quat_w[t],
-            future_dof_pos[t], num_actions,
-        )
-        body_pos_w[t] = compute_extended_body_pos_w(
-            ref_data, tracked_body_ids, extended_parent_ids, extended_local_offsets,
-        )
-
-    rel = body_pos_w - np.asarray(robot_root_pos_w, dtype=np.float64).reshape(1, 1, 3)
-    heading_inv = heading_quat_from_quat(robot_root_quat_w, inverse=True)  # [4]
-    heading_inv_b = np.broadcast_to(heading_inv, (T, num_bodies, 4))
-    pos_h = quat_apply(heading_inv_b, rel)  # [T, B, 3]
-    return pos_h.astype(np.float32).reshape(-1)
+    body_pos_w = compute_future_body_pos_w(
+        model, ref_data, future_root_pos_w, future_root_quat_w, future_dof_pos,
+        tracked_body_ids, extended_parent_ids, extended_local_offsets, num_actions,
+    )
+    return future_pos_h_from_body_pos(body_pos_w, robot_root_pos_w, robot_root_quat_w)
 
 
 def compute_future_motion_anchor(future_root_quat_w, robot_root_quat_w):
@@ -252,13 +274,15 @@ def compute_future_motion_anchor(future_root_quat_w, robot_root_quat_w):
     return quat_to_rot6d(rel_hc).astype(np.float32).reshape(-1)
 
 
-def parse_future_raw(raw_pos, raw_rot, raw_dof, num_future_steps, num_actions):
+def parse_future_raw(raw_pos, raw_rot, raw_dof, num_future_steps, num_actions,
+                     raw_lin_vel=None, raw_ang_vel=None):
     """Parse the motion server's future-frame Redis payloads into arrays.
 
     Each payload is a flattened JSON list. Returns
-    ``(root_pos [T,3], root_rot [T,4] xyzw, dof [T,J])`` or ``None`` when any
-    payload is missing or the wrong size (callers then use the stationary
-    fallback)."""
+    ``(root_pos [T,3], root_rot [T,4] xyzw, dof [T,J], lin_vel [T,3]|None, ang_vel [T,3]|None)``
+    or ``None`` when pos/rot/dof is missing or the wrong size (callers then use the
+    stationary fallback). The velocities (world frame of the published motion) are
+    optional: an older motion server that does not publish them yields None."""
     if raw_pos is None or raw_rot is None or raw_dof is None:
         return None
     T, J = num_future_steps, num_actions
@@ -270,7 +294,64 @@ def parse_future_raw(raw_pos, raw_rot, raw_dof, num_future_steps, num_actions):
         return None
     if pos.size != T * 3 or rot.size != T * 4 or dof.size != T * J:
         return None
-    return pos.reshape(T, 3), rot.reshape(T, 4), dof.reshape(T, J)
+
+    def _vel(raw):
+        if raw is None:
+            return None
+        try:
+            v = np.asarray(json.loads(raw), dtype=np.float64)
+        except Exception:
+            return None
+        return v.reshape(T, 3) if v.size == T * 3 else None
+
+    return pos.reshape(T, 3), rot.reshape(T, 4), dof.reshape(T, J), _vel(raw_lin_vel), _vel(raw_ang_vel)
+
+
+def resolve_future_frames(
+    num_future_steps, num_actions,
+    future_raw=None, anchor_delta_xy=None,
+    fallback_action_mimic=None, fallback_root_xy=None,
+):
+    """Resolve the T future reference frames into the robot world frame.
+
+    Returns ``(root_pos [T,3], root_quat_wxyz [T,4], dof [T,J], lin_vel [T,3], ang_vel [T,3])``
+    float64. With ``future_raw`` (as returned by parse_future_raw) the published
+    frames are used, shifted by ``anchor_delta_xy`` when given; unpublished
+    velocities become zeros. Without it the stationary fallback repeats the current
+    mimic target T times with zero velocities (idle / before the motion server
+    publishes future frames -- the robot is holding pose so a non-progressing future
+    is the right default).
+    """
+    T, J = num_future_steps, num_actions
+    if future_raw is not None:
+        f_pos, f_rot_xyzw, f_dof = future_raw[0], future_raw[1], future_raw[2]
+        f_lin_vel = future_raw[3] if len(future_raw) > 3 else None
+        f_ang_vel = future_raw[4] if len(future_raw) > 4 else None
+        f_pos = np.asarray(f_pos, dtype=np.float64).reshape(T, 3).copy()
+        if anchor_delta_xy is not None:
+            f_pos[:, :2] += np.asarray(anchor_delta_xy, dtype=np.float64).reshape(2)
+        f_rot_xyzw = np.asarray(f_rot_xyzw, dtype=np.float64).reshape(T, 4)
+        # motion-lib quats are xyzw; the FK/quat math here uses wxyz.
+        f_quat_wxyz = f_rot_xyzw[:, [3, 0, 1, 2]]
+        f_dof = np.asarray(f_dof, dtype=np.float64).reshape(T, J)
+        f_lin_vel = (np.zeros((T, 3)) if f_lin_vel is None
+                     else np.asarray(f_lin_vel, dtype=np.float64).reshape(T, 3))
+        f_ang_vel = (np.zeros((T, 3)) if f_ang_vel is None
+                     else np.asarray(f_ang_vel, dtype=np.float64).reshape(T, 3))
+    else:
+        am = np.asarray(fallback_action_mimic, dtype=np.float64)
+        z, roll, pitch, yaw = am[2], am[3], am[4], am[5]
+        dof = am[-J:]
+        xy = (np.asarray(fallback_root_xy, dtype=np.float64).reshape(2)
+              if fallback_root_xy is not None else np.zeros(2, dtype=np.float64))
+        pose = np.array([xy[0], xy[1], z], dtype=np.float64)
+        quat = rpy_to_quat(float(roll), float(pitch), float(yaw))
+        f_pos = np.broadcast_to(pose, (T, 3)).copy()
+        f_quat_wxyz = np.broadcast_to(quat, (T, 4)).copy()
+        f_dof = np.broadcast_to(np.asarray(dof, dtype=np.float64), (T, J)).copy()
+        f_lin_vel = np.zeros((T, 3), dtype=np.float64)
+        f_ang_vel = np.zeros((T, 3), dtype=np.float64)
+    return f_pos, f_quat_wxyz, f_dof, f_lin_vel, f_ang_vel
 
 
 def compute_future_motion_obs(
@@ -300,31 +381,10 @@ def compute_future_motion_obs(
     Returns:
         (future_motion_pos_h [T*B*3], future_motion_anchor [T*6]) float32 arrays.
     """
-    T = num_future_steps
-    if future_raw is not None:
-        f_pos, f_rot_xyzw, f_dof = future_raw
-        f_pos = np.asarray(f_pos, dtype=np.float64).reshape(T, 3).copy()
-        if anchor_delta_xy is not None:
-            f_pos[:, :2] += np.asarray(anchor_delta_xy, dtype=np.float64).reshape(2)
-        f_rot_xyzw = np.asarray(f_rot_xyzw, dtype=np.float64).reshape(T, 4)
-        # motion-lib quats are xyzw; the FK/quat math here uses wxyz.
-        f_quat_wxyz = f_rot_xyzw[:, [3, 0, 1, 2]]
-        f_dof = np.asarray(f_dof, dtype=np.float64).reshape(T, num_actions)
-    else:
-        # Stationary fallback: repeat the current mimic target frame T times. Used
-        # while idle / before the motion server publishes future frames; the robot
-        # is holding pose so a non-progressing future is the right default.
-        am = np.asarray(fallback_action_mimic, dtype=np.float64)
-        z, roll, pitch, yaw = am[2], am[3], am[4], am[5]
-        dof = am[-num_actions:]
-        xy = (np.asarray(fallback_root_xy, dtype=np.float64).reshape(2)
-              if fallback_root_xy is not None else np.zeros(2, dtype=np.float64))
-        pose = np.array([xy[0], xy[1], z], dtype=np.float64)
-        quat = rpy_to_quat(float(roll), float(pitch), float(yaw))
-        f_pos = np.broadcast_to(pose, (T, 3)).copy()
-        f_quat_wxyz = np.broadcast_to(quat, (T, 4)).copy()
-        f_dof = np.broadcast_to(np.asarray(dof, dtype=np.float64), (T, num_actions)).copy()
-
+    f_pos, f_quat_wxyz, f_dof, _, _ = resolve_future_frames(
+        num_future_steps, num_actions, future_raw=future_raw, anchor_delta_xy=anchor_delta_xy,
+        fallback_action_mimic=fallback_action_mimic, fallback_root_xy=fallback_root_xy,
+    )
     pos_h = compute_future_motion_pos_h(
         model, ref_data, f_pos, f_quat_wxyz, f_dof,
         tracked_body_ids, extended_parent_ids, extended_local_offsets,

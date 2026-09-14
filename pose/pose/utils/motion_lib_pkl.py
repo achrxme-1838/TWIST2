@@ -7,20 +7,36 @@ from pose.utils.torch_utils import quat_diff, quat_to_exp_map, slerp, euler_from
 from tqdm import tqdm
 from rich import print
 from pose.utils.isaacgym_torch_utils import quat_rotate_inverse, quat_mul, quat_conjugate
-import sys
-from types import ModuleType
 import numpy as np
 
-# Patch sys.modules to fake missing modules from numpy 2.x
-class FakeModule(ModuleType):
-    def __init__(self, name, real=None):
-        super().__init__(name)
-        if real:
-            self.__dict__.update(real.__dict__)
 
-# Patch potentially missing modules
-sys.modules['numpy._core'] = FakeModule('numpy._core', np.core if hasattr(np, 'core') else np)
-sys.modules['numpy._core.multiarray'] = FakeModule('numpy._core.multiarray', getattr(np.core, 'multiarray', None))
+class _NumpyCompatUnpickler(pickle.Unpickler):
+    """Load pickles written with numpy>=2 (which reference ``numpy._core``) on
+    numpy 1.x by remapping the module path at unpickle time. Scoped to the
+    unpickler on purpose: faking ``numpy._core`` in ``sys.modules`` globally
+    breaks ``import scipy`` on numpy 1.x."""
+
+    def find_class(self, module, name):
+        if module.startswith("numpy._core"):
+            try:
+                return super().find_class(module, name)
+            except (ImportError, AttributeError):
+                module = "numpy.core" + module[len("numpy._core"):]
+        return super().find_class(module, name)
+
+
+def load_motion_pickle(path):
+    """Plain pickle first; joblib dumps (e.g. files written by joblib.dump / the
+    DEX_RL_LAB integrated datasets) as a fallback when joblib is installed."""
+    try:
+        with open(path, "rb") as f:
+            return _NumpyCompatUnpickler(f).load()
+    except pickle.UnpicklingError as pickle_err:
+        try:
+            import joblib
+        except ImportError:
+            raise pickle_err
+        return joblib.load(path)
 
 
 def smooth(x, box_pts, device):
@@ -147,8 +163,7 @@ class MotionLib:
                 continue
 
             try:
-                with open(curr_file, "rb") as f:
-                    motion_data = pickle.load(f)
+                motion_data = load_motion_pickle(curr_file)
             except Exception as e:
                 print(f"Error loading motion file {curr_file}: {e}")
                 continue

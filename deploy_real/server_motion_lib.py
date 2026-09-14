@@ -20,6 +20,7 @@ from data_utils.rot_utils import euler_from_quaternion_torch, quat_rotate_invers
 
 from data_utils.params import DEFAULT_MIMIC_OBS
 from cfg import g1_29dof_cfg as cfg
+from policy_spec import load_spec
 
 
 # Per-process motion epoch. Each motion-server launch (= one motion) gets a fresh
@@ -181,6 +182,7 @@ def main(args, xml_file, robot_base):
     if args.use_remote_control:
         print("[Motion Server] Remote control enabled. Waiting for start signal from robot controller...")
 
+    viewer = None
     if args.vis:
         sim_model = mujoco.MjModel.from_xml_path(xml_file)
         sim_data = mujoco.MjData(sim_model)
@@ -203,11 +205,21 @@ def main(args, xml_file, robot_base):
     tar_motion_steps = [int(x.strip()) for x in args.steps.split(",")]
     tar_motion_steps_tensor = torch.tensor(tar_motion_steps, device=device, dtype=torch.long)
 
-    # Future-frame steps for future_motion_pos_h / future_motion_anchor. Fixed to
-    # the training schedule ([5, 10, ..., 50] control steps = (i+1)*step_interval),
-    # independent of --steps (which only controls the single mimic target).
+    # Future-frame steps for the future_motion_* observations: (i+1)*step_interval
+    # control steps for i < num_future_steps, taken from the policy spec so they
+    # match the checkpoint the controller runs (--obs_cfg, same file as the
+    # controller's). Independent of --steps (which only controls the mimic target).
+    if args.obs_cfg:
+        spec = load_spec(args.obs_cfg)
+        future_motion_steps = spec.future_motion_steps
+        print(f"[Motion Server] publishing T={spec.future_steps} future frames at +{future_motion_steps} "
+              f"control steps (interval={spec.future_interval}); the controller's terms use the first "
+              f"{spec.used_future_steps} ({args.obs_cfg}).")
+    else:
+        future_motion_steps = cfg.FUTURE_MOTION_STEPS
+        print(f"[Motion Server] no --obs_cfg: future frames at legacy cfg steps {future_motion_steps}")
     tar_future_steps_tensor = torch.tensor(
-        cfg.FUTURE_MOTION_STEPS, device=device, dtype=torch.long
+        future_motion_steps, device=device, dtype=torch.long
     )
 
     # 4. Loop over time steps and publish mimic obs
@@ -271,7 +283,7 @@ def main(args, xml_file, robot_base):
         yaw-anchor, fix_root and playback-speed transforms are applied identically),
         but sampled at the fixed future schedule. root_rot is published as xyzw
         (motion-lib convention); the controller converts to wxyz."""
-        _, fr_pos, fr_rot, fr_dof, _, _ = build_mimic_obs(
+        _, fr_pos, fr_rot, fr_dof, fr_lin_vel, fr_ang_vel = build_mimic_obs(
             motion_lib=motion_lib,
             t_step=t_step_for_future,
             control_dt=control_dt,
@@ -290,6 +302,12 @@ def main(args, xml_file, robot_base):
                          json.dumps(np.asarray(fr_rot, dtype=np.float64).reshape(-1).tolist()))
         redis_client.set(f"{cfg.FUTURE_MOTION_DOF_POS_KEY}_{args.robot}",
                          json.dumps(np.asarray(fr_dof, dtype=np.float64).reshape(-1).tolist()))
+        # World-frame root velocities of the same frames (future_motion_root_lin_vel_pb /
+        # root_ang_vel_b); already yaw-anchored and playback-speed scaled by build_mimic_obs.
+        redis_client.set(f"{cfg.FUTURE_MOTION_ROOT_LIN_VEL_KEY}_{args.robot}",
+                         json.dumps(np.asarray(fr_lin_vel, dtype=np.float64).reshape(-1).tolist()))
+        redis_client.set(f"{cfg.FUTURE_MOTION_ROOT_ANG_VEL_KEY}_{args.robot}",
+                         json.dumps(np.asarray(fr_ang_vel, dtype=np.float64).reshape(-1).tolist()))
 
     # If motion plays immediately (no remote control), anchor right now.
     if not args.use_remote_control:
@@ -427,6 +445,7 @@ def main(args, xml_file, robot_base):
                     )
                     n_blend = max(1, int(args.blend_in_time / control_dt))
                     print(f"[Motion Server] Blending into motion start over {args.blend_in_time:.1f}s ({n_blend} steps)...")
+                    redis_client.set(f"{cfg.MOTION_PHASE_KEY}_{args.robot}", "blend")
                     for i in range(n_blend):
                         tb = time.time()
                         alpha = i / n_blend
@@ -459,6 +478,7 @@ def main(args, xml_file, robot_base):
             # Convert to JSON (list) to put into Redis
             mimic_obs_list = mimic_obs.tolist() if mimic_obs.ndim == 1 else mimic_obs.flatten().tolist()
             redis_client.set(f"action_body_{args.robot}", json.dumps(mimic_obs_list))
+            redis_client.set(f"{cfg.MOTION_PHASE_KEY}_{args.robot}", "motion")
             redis_client.set(f"action_hand_left_{args.robot}", json.dumps(np.zeros(7).tolist()))
             redis_client.set(f"action_hand_right_{args.robot}", json.dumps(np.zeros(7).tolist()))
             redis_client.set(f"action_neck_{args.robot}", json.dumps(np.zeros(2).tolist()))
@@ -501,6 +521,7 @@ def main(args, xml_file, robot_base):
     except Exception as e:
         print(f"[Motion Server] Error: {e}")
         print("[Motion Server] Keyboard interrupt. Interpolating to default mimic_obs...")
+        redis_client.set(f"{cfg.MOTION_PHASE_KEY}_{args.robot}", "return")
         # do linear interpolation to the last mimic_obs
         time_back_to_default = 2.0
         target_mimic_obs = start_frame_mimic_obs if args.send_start_frame_as_end_frame and start_frame_mimic_obs is not None else DEFAULT_MIMIC_OBS[args.robot]
@@ -509,8 +530,10 @@ def main(args, xml_file, robot_base):
             redis_client.set(f"action_body_{args.robot}", json.dumps(interp_mimic_obs.tolist()))
             time.sleep(control_dt)
         redis_client.set(f"action_body_{args.robot}", json.dumps(target_mimic_obs.tolist()))
+        redis_client.delete(f"{cfg.MOTION_PHASE_KEY}_{args.robot}")
         last_mimic_obs = target_mimic_obs
-        viewer.close()
+        if viewer is not None:
+            viewer.close()
         time.sleep(0.5)
         exit()
     finally:
@@ -518,12 +541,9 @@ def main(args, xml_file, robot_base):
         # Drop this motion's future-motion frames so they don't bleed into the next
         # motion (the controller falls back to a stationary future = the default
         # pose it interpolates to below). ref_root_world/epoch are left as-is.
-        redis_client.delete(
-            f"{cfg.FUTURE_MOTION_ROOT_POS_KEY}_{args.robot}",
-            f"{cfg.FUTURE_MOTION_ROOT_ROT_KEY}_{args.robot}",
-            f"{cfg.FUTURE_MOTION_DOF_POS_KEY}_{args.robot}",
-        )
+        redis_client.delete(*[f"{k}_{args.robot}" for k in cfg.FUTURE_MOTION_KEYS])
         # do linear interpolation to the last mimic_obs
+        redis_client.set(f"{cfg.MOTION_PHASE_KEY}_{args.robot}", "return")
         time_back_to_default = 2.0
         target_mimic_obs = start_frame_mimic_obs if args.send_start_frame_as_end_frame and start_frame_mimic_obs is not None else DEFAULT_MIMIC_OBS[args.robot]
         for i in range(int(time_back_to_default / control_dt)):
@@ -531,8 +551,10 @@ def main(args, xml_file, robot_base):
             redis_client.set(f"action_body_{args.robot}", json.dumps(interp_mimic_obs.tolist()))
             time.sleep(control_dt)
         redis_client.set(f"action_body_{args.robot}", json.dumps(target_mimic_obs.tolist()))
+        redis_client.delete(f"{cfg.MOTION_PHASE_KEY}_{args.robot}")
         last_mimic_obs = target_mimic_obs
-        viewer.close()
+        if viewer is not None:
+            viewer.close()
         time.sleep(0.5)
         exit()
     
@@ -584,10 +606,12 @@ if __name__ == "__main__":
                              "motion by a CONSTANT delta so motion frame 0's yaw matches "
                              "robot's heading. Preserves the motion's yaw progression "
                              "(unlike --fix_root_heading which freezes yaw).")
+    parser.add_argument("--obs_cfg", type=str, default=None,
+                        help="Policy spec yaml of the controller's checkpoint (same file as the "
+                             "controller's --obs_cfg); sets the future-frame schedule "
+                             "(num_future_steps / step_interval). Default: legacy cfg schedule.")
     args = parser.parse_args()
 
-    args.vis = True
-    
 
     print("Robot type: ", args.robot)
     print("Motion file: ", args.motion_file)

@@ -77,6 +77,7 @@ motion_file="${script_dir}/assets/test/A1-Stand_poses.pkl"
 PY=/workspace/isaaclab/_isaac_sim/python.sh
 export PYTHONNOUSERSITE=1
 unset PYTHONPATH
+export PYTHONPATH=${script_dir}/pose   # pose.utils.motion_lib_pkl (not pip-installed in the container)
 redis-cli ping >/dev/null 2>&1 || redis-server --daemonize yes --bind 127.0.0.1 --save "" --appendonly no
 
 # Change to deploy_real directory

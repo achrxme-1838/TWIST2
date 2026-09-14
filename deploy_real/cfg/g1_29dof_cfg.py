@@ -125,6 +125,11 @@ EXTENDED_JOINTS = [
 
 NUM_TRACKED_BODIES = len(TRACKED_BODY_NAMES) + len(EXTENDED_JOINTS)  # 33
 
+# ===== LEGACY policy constants -- used only by server_low_level_g1_real.py =====
+# The sim controller and the motion server take the observation layout, history
+# lengths and future-step schedule from the per-policy spec (<ckpt>.yaml, see
+# policy_spec.py). Delete this block once the real-robot server is ported too.
+
 # Observation history (term-major IsaacLab CircularBuffer).
 HISTORY_LEN = 10
 HIST_TERM_DIMS = {
@@ -156,9 +161,22 @@ FUTURE_MOTION_STEPS = [(i + 1) * FUTURE_STEP_INTERVAL for i in range(NUM_FUTURE_
 # future_motion_anchor:   T * 6     (heading-corrected base->ref-root rot, 6D).
 FUTURE_MOTION_POS_DIM = NUM_FUTURE_STEPS * NUM_TRACKED_BODIES * 3  # 10*33*3 = 990
 FUTURE_MOTION_ANCHOR_DIM = NUM_FUTURE_STEPS * 6                    # 10*6   = 60
+# ===== end LEGACY =====
 
 # Redis keys the motion server publishes the future reference frames to. Each holds
-# a flattened JSON list: root_pos [T*3], root_rot [T*4] (xyzw), dof_pos [T*J] (SDK order).
+# a flattened JSON list: root_pos [T*3], root_rot [T*4] (xyzw), dof_pos [T*J] (SDK
+# order), root_lin_vel / root_ang_vel [T*3] (world frame of the published motion).
 FUTURE_MOTION_ROOT_POS_KEY = "future_motion_root_pos"
 FUTURE_MOTION_ROOT_ROT_KEY = "future_motion_root_rot"
 FUTURE_MOTION_DOF_POS_KEY = "future_motion_dof_pos"
+FUTURE_MOTION_ROOT_LIN_VEL_KEY = "future_motion_root_lin_vel"
+FUTURE_MOTION_ROOT_ANG_VEL_KEY = "future_motion_root_ang_vel"
+FUTURE_MOTION_KEYS = (
+    FUTURE_MOTION_ROOT_POS_KEY, FUTURE_MOTION_ROOT_ROT_KEY, FUTURE_MOTION_DOF_POS_KEY,
+    FUTURE_MOTION_ROOT_LIN_VEL_KEY, FUTURE_MOTION_ROOT_ANG_VEL_KEY,
+)
+
+# Motion-server playback phase, published as "<MOTION_PHASE_KEY>_<robot>" with
+# values "blend" / "motion" / "return"; absent (deleted) while no server is running.
+# The controller only uses it for the video overlay (no effect on the policy).
+MOTION_PHASE_KEY = "motion_phase"

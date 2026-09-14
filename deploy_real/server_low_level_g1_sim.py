@@ -1,15 +1,16 @@
 import argparse
 import json
+import signal
 import sys
 import time
 import os
-from collections import deque
 
 # --headless renders offscreen; MuJoCo picks its GL backend at import time, so
 # the env var has to be set before `import mujoco`.
 if "--headless" in sys.argv:
     os.environ.setdefault("MUJOCO_GL", "egl")
 
+import cv2
 import numpy as np
 import redis
 import mujoco
@@ -22,12 +23,10 @@ from data_utils.rot_utils import quatToEuler
 from data_utils.params import DEFAULT_MIMIC_OBS
 
 from cfg import g1_29dof_cfg as cfg
-from observations import (
-    compute_diff_body_pos_b,
-    compute_diff_body_tannorm_b,
-    compute_future_motion_obs,
-    parse_future_raw,
-)
+from observations import _drive_ref_data, parse_future_raw
+from obs_builder import ObsBuilder
+from obs_terms import ObsContext, StaticContext
+from policy_spec import resolve_spec
 from safety import SafetyController, StdinKeyListener
 from utils.math import yaw_from_quat
 
@@ -69,9 +68,11 @@ def load_onnx_policy(policy_path: str, device: str) -> OnnxPolicyWrapper:
             print("CUDAExecutionProvider not available in onnxruntime; falling back to CPUExecutionProvider.")
     providers.append('CPUExecutionProvider')
     session = ort.InferenceSession(policy_path, providers=providers)
-    input_name = session.get_inputs()[0].name
+    inp = session.get_inputs()[0]
     print(f"ONNX policy loaded from {policy_path} using providers: {session.get_providers()}")
-    return OnnxPolicyWrapper(session, input_name)
+    wrapper = OnnxPolicyWrapper(session, inp.name)
+    wrapper.input_dim = int(inp.shape[-1]) if isinstance(inp.shape[-1], int) else None
+    return wrapper
 
 
 class EMASmoother:
@@ -105,9 +106,7 @@ class RealTimePolicyController:
                  measure_fps=False,
                  limit_fps=True,
                  policy_frequency=50,
-                 use_diff_body_pos=False,
-                 use_diff_body_tannorm=False,
-                 use_future_motion=False,
+                 obs_cfg=None,
                  smooth_action=0.0,
                  kp_scale=1.0,
                  kd_scale=1.0,
@@ -117,6 +116,7 @@ class RealTimePolicyController:
                  headless=False,
                  video_path="twist2_simulation.mp4",
                  video_size=(640, 480),
+                 video_ref=False,
                  sim_duration=100000.0,
                  ):
         self.measure_fps = measure_fps
@@ -145,6 +145,7 @@ class RealTimePolicyController:
         self.viewer = None
         self.renderer = None      # offscreen renderer (headless + record_video)
         self.render_cam = None
+        self.video_ref = bool(video_ref and headless and record_video)
         self.key_listener = None  # stdin keys stand in for the viewer key callback
         if not headless:
             self.viewer = mjv.launch_passive(
@@ -168,6 +169,16 @@ class RealTimePolicyController:
                 self.render_cam.distance = 2.0
                 self.render_cam.azimuth = 90.0
                 self.render_cam.elevation = -20.0
+                # Optional second pane: the reference pose (mimic target driven through
+                # FK on a private MjData), rendered side by side with the robot.
+                if self.video_ref:
+                    self.ref_render_data = mujoco.MjData(self.model)
+                    self.ref_render_cam = mujoco.MjvCamera()
+                    self.ref_render_cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+                    self.ref_render_cam.distance = 2.0
+                    self.ref_render_cam.azimuth = 90.0
+                    self.ref_render_cam.elevation = -20.0
+                    print(f"[headless] video: robot | reference side by side ({2 * w}x{h})")
             self.key_listener = StdinKeyListener(self.safety.handle_keycode)
 
         self.num_actions = cfg.NUM_ACTIONS
@@ -212,42 +223,12 @@ class RealTimePolicyController:
         )
 
         self.default_dof_pos_isaac = self.default_dof_pos[self.sdk_to_isaac]
-        self.ankle_idx_isaac = [cfg.ISAAC_JOINT_NAMES.index(n) for n in cfg.ANKLE_JOINT_NAMES]
 
-        # ----- observation layout (matches DEX_RL_LAB PolicyCfg, term-major) -----
-        # CircularBuffer flatten = [oldest..newest]; terms concatenated in declaration order.
-        self.history_len = cfg.HISTORY_LEN
-        self._hist_dims = cfg.HIST_TERM_DIMS
-        self._hist_term_order = cfg.HIST_TERM_ORDER
-        self._mimic_dim = cfg.MIMIC_DIM
+        # ----- observation layout: from the policy spec (see policy_spec.py) -----
+        self.spec = resolve_spec(policy_path, obs_cfg)
+        print(self.spec.describe())
 
-        # Optional diff_body_* terms (declared after mimic in PolicyCfg).
-        self.use_diff_body_pos = use_diff_body_pos
-        self._diff_body_pos_per_step = cfg.NUM_TRACKED_BODIES * 3   # 99
-        self._diff_body_pos_total = (
-            self.history_len * self._diff_body_pos_per_step if use_diff_body_pos else 0
-        )
-        self.use_diff_body_tannorm = use_diff_body_tannorm
-        self._diff_body_tannorm_per_step = cfg.NUM_TRACKED_BODIES * 6  # 198
-        self._diff_body_tannorm_total = (
-            self.history_len * self._diff_body_tannorm_per_step if use_diff_body_tannorm else 0
-        )
-
-        # Future-motion terms (no history): future_motion_pos_h + future_motion_anchor.
-        self.use_future_motion = use_future_motion
-        self._future_motion_pos_total = cfg.FUTURE_MOTION_POS_DIM if use_future_motion else 0
-        self._future_motion_anchor_total = cfg.FUTURE_MOTION_ANCHOR_DIM if use_future_motion else 0
-
-        self.total_obs_size = (
-            self.history_len * sum(self._hist_dims.values())
-            + self._mimic_dim
-            + self._diff_body_pos_total
-            + self._diff_body_tannorm_total
-            + self._future_motion_pos_total
-            + self._future_motion_anchor_total
-        )
-
-        # Body-id caches for FK-based diff terms.
+        # Body-id caches for FK-based diff / future terms.
         self.tracked_body_ids = np.array(
             [self.model.body(n).id for n in cfg.TRACKED_BODY_NAMES], dtype=np.int64
         )
@@ -257,52 +238,31 @@ class RealTimePolicyController:
         self.extended_local_offsets = np.array(
             [offset for _, _, offset in cfg.EXTENDED_JOINTS], dtype=np.float64
         )
-        # Secondary MjData for FK on the reference motion frame.
-        self.ref_data = (
-            mujoco.MjData(self.model)
-            if (use_diff_body_pos or use_diff_body_tannorm) else None
-        )
-        # Dedicated MjData for FK on the future reference frames (future_motion_pos_h).
-        self.future_ref_data = (
-            mujoco.MjData(self.model) if use_future_motion else None
-        )
+        # Secondary MjData for FK on the current reference frame (diff_body_* terms)
+        # and on the future reference frames (future_motion_* terms).
+        self.ref_data = mujoco.MjData(self.model) if self.spec.needs_ref_fk else None
+        self.future_ref_data = mujoco.MjData(self.model) if self.spec.needs_future else None
 
-        # Per-term ring buffers (zero-init mimics IsaacLab CircularBuffer first-push fill).
-        self._hist_bufs = {
-            name: deque(
-                [np.zeros(d, dtype=np.float32) for _ in range(self.history_len)],
-                maxlen=self.history_len,
-            )
-            for name, d in self._hist_dims.items()
-        }
-        self._diff_body_pos_hist = (
-            deque(
-                [np.zeros(self._diff_body_pos_per_step, dtype=np.float32) for _ in range(self.history_len)],
-                maxlen=self.history_len,
-            )
-            if use_diff_body_pos else None
+        self.obs_static = StaticContext(
+            model=self.model,
+            num_actions=self.num_actions,
+            tracked_body_ids=self.tracked_body_ids,
+            extended_parent_ids=self.extended_parent_ids,
+            extended_local_offsets=self.extended_local_offsets,
+            default_dof_pos_isaac=self.default_dof_pos_isaac,
+            isaac_joint_names=list(cfg.ISAAC_JOINT_NAMES),
+            future_steps=self.spec.future_steps,
+            future_fk_steps=max(self.spec.used_future_steps, 1),
         )
-        self._diff_body_tannorm_hist = (
-            deque(
-                [np.zeros(self._diff_body_tannorm_per_step, dtype=np.float32) for _ in range(self.history_len)],
-                maxlen=self.history_len,
+        self.obs_builder = ObsBuilder(self.spec, self.obs_static)
+        self.total_obs_size = self.obs_builder.obs_dim
+        print(self.obs_builder.describe())
+        policy_dim = getattr(self.policy, "input_dim", None)
+        if policy_dim is not None and policy_dim != self.total_obs_size:
+            raise ValueError(
+                f"policy {policy_path} expects {policy_dim} obs but the spec builds "
+                f"{self.total_obs_size} -- wrong --obs_cfg for this checkpoint?"
             )
-            if use_diff_body_tannorm else None
-        )
-
-        print("TWIST2 Controller obs layout (term-major):")
-        for name in self._hist_term_order:
-            d = self._hist_dims[name]
-            print(f"  {name}: history={self.history_len} x dim={d} = {self.history_len * d}")
-        print(f"  future_motion_mimic_target (no history): {self._mimic_dim}")
-        if use_diff_body_pos:
-            print(f"  diff_body_pos_b: history={self.history_len} x dim={self._diff_body_pos_per_step} = {self._diff_body_pos_total}")
-        if use_diff_body_tannorm:
-            print(f"  diff_body_tannorm_b: history={self.history_len} x dim={self._diff_body_tannorm_per_step} = {self._diff_body_tannorm_total}")
-        if use_future_motion:
-            print(f"  future_motion_pos_h (no history): {self._future_motion_pos_total}")
-            print(f"  future_motion_anchor (no history): {self._future_motion_anchor_total}")
-        print(f"  total_obs_size: {self.total_obs_size}")
 
         # ----- odom-based world-root tracking for diff_body_* terms -----
         # When enabled, the reference motion root is anchored (per motion) to the
@@ -329,6 +289,30 @@ class RealTimePolicyController:
         self.record_video = record_video
         self.record_proprio = record_proprio
         self.proprio_recordings = [] if record_proprio else None
+
+    def _render_ref(self, action_mimic):
+        """Render the current mimic target as a robot pose (FK only). The reference
+        root is placed at the robot's world xy so both panes are framed alike; z /
+        roll / pitch / yaw / joints come from the target itself."""
+        _drive_ref_data(
+            self.model, self.ref_render_data, action_mimic, self.num_actions,
+            ref_root_xy_w=self.data.qpos[:2],
+        )
+        self.ref_render_cam.lookat[:] = self.ref_render_data.xpos[self.model.body("pelvis").id]
+        self.renderer.update_scene(self.ref_render_data, camera=self.ref_render_cam)
+        img = np.ascontiguousarray(self.renderer.render())
+        cv2.putText(img, "REF", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(img, "REF", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+        return img
+
+    def _overlay(self, img, sim_step, phase):
+        """Stamp sim time + motion-server phase (IDLE / BLEND / MOTION / RETURN) on a
+        video frame. IDLE = no phase key on Redis (controller tracks the default seed)."""
+        img = np.ascontiguousarray(img)
+        text = f"t={sim_step * self.sim_dt:6.2f}s  {phase}"
+        cv2.putText(img, text, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(img, text, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+        return img
 
     def reset_sim(self):
         mujoco.mj_resetData(self.model, self.data)
@@ -414,50 +398,39 @@ class RealTimePolicyController:
 
     def compute_observation(self, dof_pos, dof_vel, ang_vel, rpy, action_mimic,
                             ref_root_xy_w=None, future_raw=None):
-        """Build the flat observation tensor in PolicyCfg term-major order.
+        """Build the flat observation tensor in policy-spec order.
 
         dof_pos / dof_vel come in SDK order; permuted to Isaac order before the
         policy sees them. last_action is already in Isaac order (raw policy out).
-        Updates all history buffers as a side effect.
+        Updates the builder's history buffers as a side effect.
         """
         # Only run the odom (absolute world-root) diff once a world root has been
         # resolved; otherwise fall back to the legacy pelvis-relative diff so the
         # ref/robot frames stay consistent.
         odom_on = self.update_robot_w_odom and ref_root_xy_w is not None
 
-        dof_pos_isaac = dof_pos[self.sdk_to_isaac]
-        dof_vel_isaac = dof_vel[self.sdk_to_isaac].copy()
-        dof_vel_isaac[self.ankle_idx_isaac] = 0.0
+        ctx = ObsContext(
+            static=self.obs_static,
+            data=self.data,
+            dof_pos_isaac=dof_pos[self.sdk_to_isaac],
+            dof_vel_isaac=dof_vel[self.sdk_to_isaac],
+            ang_vel=ang_vel,
+            rpy=rpy,
+            last_action=self.last_action,
+            action_mimic=action_mimic,
+            ref_data=self.ref_data,
+            future_ref_data=self.future_ref_data,
+            future_raw=future_raw,
+            ref_root_xy_w=ref_root_xy_w,
+            odom_on=odom_on,
+            anchor_delta_xy=self._anchor_delta_xy() if odom_on else None,
+        )
+        obs_buf = self.obs_builder(ctx)
 
-        term_current = {
-            "base_ang_vel":    (ang_vel * 0.25).astype(np.float32),
-            "base_roll_pitch": rpy[:2].astype(np.float32),
-            "joint_pos_rel":   (dof_pos_isaac - self.default_dof_pos_isaac).astype(np.float32),
-            "joint_vel_rel":   (dof_vel_isaac * 0.05).astype(np.float32),
-            "last_action":     self.last_action.astype(np.float32),
-        }
-        for name in self._hist_term_order:
-            self._hist_bufs[name].append(term_current[name])
-
-        flat_parts = [
-            np.asarray(self._hist_bufs[name], dtype=np.float32).reshape(-1)
-            for name in self._hist_term_order
-        ]
-        flat_parts.append(action_mimic)
-
-        if self.use_diff_body_pos:
-            diff = compute_diff_body_pos_b(
-                self.model, self.data, self.ref_data, action_mimic,
-                self.tracked_body_ids, self.extended_parent_ids, self.extended_local_offsets,
-                self.num_actions, use_pb=False,
-                update_robot_w_odom=odom_on,
-                ref_root_xy_w=ref_root_xy_w,
-            )
-            self._diff_body_pos_hist.append(diff)
-            flat_parts.append(np.asarray(self._diff_body_pos_hist, dtype=np.float32).reshape(-1))
-            # diag: world-frame root tracking error (ref - robot) [x,y,z]. Should
-            # hover ~0 when tracking well; a persistent z bias => height calibration,
-            # persistent xy => anchor/translation lag. (~0.5s cadence)
+        # diag (~0.5s cadence): world-frame root tracking error (ref - robot) [x,y,z].
+        # Should hover ~0 when tracking well; a persistent z bias => height
+        # calibration, persistent xy => anchor/translation lag.
+        if self.spec.needs_ref_fk:
             self._diff_log_i = getattr(self, "_diff_log_i", 0) + 1
             if self._diff_log_i % 25 == 0:
                 ref_xy = ref_root_xy_w if ref_root_xy_w is not None else self.data.qpos[:2]
@@ -465,47 +438,22 @@ class RealTimePolicyController:
                 dy = float(ref_xy[1]) - float(self.data.qpos[1])
                 dz = float(action_mimic[2]) - float(self.data.qpos[2])
                 print(f"[root err ref-robot] odom={odom_on} x={dx:+.3f} y={dy:+.3f} z={dz:+.3f}")
-
-        if self.use_diff_body_tannorm:
-            diff = compute_diff_body_tannorm_b(
-                self.model, self.data, self.ref_data, action_mimic,
-                self.tracked_body_ids, self.extended_parent_ids,
-                self.num_actions, use_pb=True,
-                update_robot_w_odom=odom_on,
-                ref_root_xy_w=ref_root_xy_w,
-            )
-            self._diff_body_tannorm_hist.append(diff)
-            flat_parts.append(np.asarray(self._diff_body_tannorm_hist, dtype=np.float32).reshape(-1))
-
-        if self.use_future_motion:
-            # Robot world root is MuJoCo GT in sim.
-            pos_h, anchor = compute_future_motion_obs(
-                self.model, self.future_ref_data,
-                cfg.NUM_FUTURE_STEPS, self.num_actions,
-                self.tracked_body_ids, self.extended_parent_ids, self.extended_local_offsets,
-                self.data.qpos[:3].copy(), self.data.qpos[3:7].copy(),
-                future_raw=future_raw,
-                anchor_delta_xy=self._anchor_delta_xy() if odom_on else None,
-                fallback_action_mimic=action_mimic,
-                fallback_root_xy=ref_root_xy_w,
-            )
-            flat_parts.append(pos_h)
-            flat_parts.append(anchor)
-            # diag (~0.5s cadence): future real-vs-fallback + pelvis future progression
-            # in the robot heading frame. For forward walking pelvis x should grow
-            # +5 -> +50; all-zero/non-progressing hints at fallback or a bad anchor.
+        # diag (~0.5s cadence): future real-vs-fallback + pelvis future progression in
+        # the robot heading frame. For forward walking pelvis x should grow with the
+        # horizon; all-zero/non-progressing hints at fallback or a bad anchor.
+        if self.spec.needs_future and "future_motion_pos_h" in self.obs_builder.slices():
             self._fut_log_i = getattr(self, "_fut_log_i", 0) + 1
             if self._fut_log_i % 25 == 0:
-                ph = pos_h.reshape(cfg.NUM_FUTURE_STEPS, cfg.NUM_TRACKED_BODIES, 3)
-                delta = self._anchor_delta_xy() if odom_on else None
+                pos_h, _ = ctx.future_obs()
+                n_fk = ctx.n_fk
+                ph = pos_h.reshape(n_fk, self.obs_static.num_bodies, 3)
                 mode = "REAL" if future_raw is not None else "fallback"
+                delta = ctx.anchor_delta_xy
+                steps = self.spec.future_motion_steps
                 print(f"[future] {mode} delta={None if delta is None else np.round(delta,3)} "
-                      f"pelvis@+5={np.round(ph[0,0],3)} pelvis@+50={np.round(ph[-1,0],3)} "
+                      f"pelvis@+{steps[0]}={np.round(ph[0,0],3)} "
+                      f"pelvis@+{steps[n_fk - 1]}={np.round(ph[-1,0],3)} "
                       f"|pos_h|max={np.abs(pos_h).max():.2f}")
-
-        obs_buf = np.concatenate(flat_parts)
-        assert obs_buf.shape[0] == self.total_obs_size, \
-            f"Expected {self.total_obs_size} obs, got {obs_buf.shape[0]}"
         return obs_buf
 
     def run(self):
@@ -522,6 +470,7 @@ class RealTimePolicyController:
 
         self.reset_sim()
         self.reset(self.mujoco_default_dof_pos)
+        self.obs_builder.reset()
 
         steps = int(self.sim_duration / self.sim_dt)
         pbar = tqdm(range(steps), desc="Simulating TWIST2...")
@@ -545,12 +494,8 @@ class RealTimePolicyController:
         # run so we start on the stationary fallback (default pose) instead of
         # chasing the previous motion's trajectory. Only the new future keys are
         # cleared -- the diff_body-shared ref_root_world/epoch are left untouched.
-        if self.use_future_motion and self.redis_client is not None:
-            self.redis_client.delete(
-                f"{cfg.FUTURE_MOTION_ROOT_POS_KEY}_{self.robot}",
-                f"{cfg.FUTURE_MOTION_ROOT_ROT_KEY}_{self.robot}",
-                f"{cfg.FUTURE_MOTION_DOF_POS_KEY}_{self.robot}",
-            )
+        if self.spec.needs_future and self.redis_client is not None:
+            self.redis_client.delete(*[f"{k}_{self.robot}" for k in cfg.FUTURE_MOTION_KEYS])
 
         measure_fps = self.measure_fps
         fps_measurements = []
@@ -562,9 +507,9 @@ class RealTimePolicyController:
         policy_step_count = 0
         policy_fps_print_interval = 100
 
+        wall_t0 = time.time()  # realtime pacing reference (see limit_fps below)
         try:
             for i in pbar:
-                t_start = time.time()
                 self.safety.drain()
                 dof_pos, dof_vel, quat, ang_vel, sim_torque = self.extract_data()
 
@@ -589,22 +534,24 @@ class RealTimePolicyController:
                         "action_hand_right_unitree_g1_with_hands",
                         "action_neck_unitree_g1_with_hands",
                     ]
-                    if self.use_future_motion:
-                        keys += [
-                            f"{cfg.FUTURE_MOTION_ROOT_POS_KEY}_{self.robot}",
-                            f"{cfg.FUTURE_MOTION_ROOT_ROT_KEY}_{self.robot}",
-                            f"{cfg.FUTURE_MOTION_DOF_POS_KEY}_{self.robot}",
-                        ]
+                    future_idx = len(keys)
+                    if self.spec.needs_future:
+                        keys += [f"{k}_{self.robot}" for k in cfg.FUTURE_MOTION_KEYS]
+                    phase_idx = len(keys)
+                    keys.append(f"{cfg.MOTION_PHASE_KEY}_{self.robot}")  # video overlay only
                     for key in keys:
                         self.redis_pipeline.get(key)
                     redis_results = self.redis_pipeline.execute()
                     action_mimic = np.asarray(json.loads(redis_results[0]), dtype=np.float32)
+                    raw_phase = redis_results[phase_idx]
+                    motion_phase = raw_phase.decode().upper() if raw_phase else "IDLE"
 
                     future_raw = None
-                    if self.use_future_motion:
+                    if self.spec.needs_future:
+                        fr = redis_results[future_idx:future_idx + len(cfg.FUTURE_MOTION_KEYS)]
                         future_raw = parse_future_raw(
-                            redis_results[4], redis_results[5], redis_results[6],
-                            cfg.NUM_FUTURE_STEPS, self.num_actions,
+                            fr[0], fr[1], fr[2], self.spec.future_steps, self.num_actions,
+                            raw_lin_vel=fr[3], raw_ang_vel=fr[4],
                         )
 
                     # Odom world-root tracking. In sim the robot world root is GT
@@ -673,11 +620,14 @@ class RealTimePolicyController:
                         self.viewer.cam.lookat = pelvis_pos
                         self.viewer.sync()
                         if mp4_writer is not None:
-                            mp4_writer.append_data(self.viewer.read_pixels())
+                            mp4_writer.append_data(self._overlay(self.viewer.read_pixels(), i, motion_phase))
                     elif self.renderer is not None:
                         self.render_cam.lookat[:] = pelvis_pos
                         self.renderer.update_scene(self.data, camera=self.render_cam)
-                        mp4_writer.append_data(self.renderer.render())
+                        frame = self._overlay(self.renderer.render(), i, motion_phase)
+                        if self.video_ref:
+                            frame = np.concatenate([frame, self._render_ref(action_mimic)], axis=1)
+                        mp4_writer.append_data(frame)
 
                     if self.record_proprio:
                         self.proprio_recordings.append({
@@ -700,9 +650,13 @@ class RealTimePolicyController:
                 mujoco.mj_step(self.model, self.data)
 
                 if self.limit_fps:
-                    elapsed = time.time() - t_start
-                    if elapsed < self.sim_dt:
-                        time.sleep(self.sim_dt - elapsed)
+                    # Pace against an absolute schedule (wall_t0 + i*dt) so sleep
+                    # overshoot on one step is absorbed by the next instead of
+                    # accumulating; keeps sim time locked to the motion server's
+                    # wall-clock streaming.
+                    ahead = wall_t0 + (i + 1) * self.sim_dt - time.time()
+                    if ahead > 0:
+                        time.sleep(ahead)
 
         except Exception as e:
             print(f"Error in run: {e}")
@@ -742,6 +696,9 @@ def main():
                              'frames are rendered offscreen; safety keys are read from stdin.')
     parser.add_argument('--video_path', type=str, default='twist2_simulation.mp4',
                         help='Output mp4 for --record_video.')
+    parser.add_argument('--video_ref', action='store_true',
+                        help='With --headless --record_video: add a second pane showing the '
+                             'reference (mimic target) pose next to the robot.')
     parser.add_argument('--video_size', type=int, nargs=2, default=(640, 480), metavar=('W', 'H'),
                         help='Offscreen render size for --headless --record_video.')
     parser.add_argument('--sim_duration', type=float, default=100000.0,
@@ -750,15 +707,10 @@ def main():
     parser.add_argument("--measure_fps", help="Measure FPS", default=0, type=int)
     parser.add_argument("--limit_fps", help="Limit FPS with sleep", default=1, type=int)
     parser.add_argument("--policy_frequency", help="Policy frequency", default=100, type=int)
-    parser.add_argument("--use_diff_body_pos", action="store_true",
-                        help="Append diff_body_pos_b observation (33 bodies * 3 = 99 dims).")
-    parser.add_argument("--use_diff_body_tannorm", action="store_true",
-                        help="Append diff_body_tannorm_b observation (33 bodies * 6 = 198 dims).")
-    parser.add_argument("--use_future_motion", action="store_true",
-                        help="Append future_motion_pos_h (T*33*3=990) and "
-                             "future_motion_anchor (T*6=60) observations. Requires the "
-                             "motion server to publish future frames and is meaningful "
-                             "only with --update_robot_w_odom (world-frame anchoring).")
+    parser.add_argument("--obs_cfg", type=str, default=None,
+                        help="Policy observation spec yaml (terms / history / future steps). "
+                             "Default: <policy>.yaml next to the ONNX. Generate it with "
+                             "DEX_RL_LAB_PHUMA/scripts/export_deploy_cfg.py.")
     parser.add_argument("--smooth_action", type=float, default=0.0,
                         help="EMA alpha for smoothing the policy's OUTPUT action (motor command). "
                              "0 disables (default). Smaller alpha = stronger smoothing but more lag. "
@@ -787,6 +739,7 @@ def main():
     print(f"Starting TWIST2 simulation controller...")
     print(f"  XML file: {args.xml}")
     print(f"  Policy file: {args.policy}")
+    print(f"  Obs cfg: {args.obs_cfg or '<policy>.yaml'}")
     print(f"  Device: {args.device}")
     print(f"  Record video: {args.record_video}" + (f" -> {args.video_path}" if args.record_video else ""))
     print(f"  Headless: {args.headless}")
@@ -805,9 +758,7 @@ def main():
         measure_fps=args.measure_fps,
         limit_fps=args.limit_fps,
         policy_frequency=args.policy_frequency,
-        use_diff_body_pos=args.use_diff_body_pos,
-        use_diff_body_tannorm=args.use_diff_body_tannorm,
-        use_future_motion=args.use_future_motion,
+        obs_cfg=args.obs_cfg,
         smooth_action=args.smooth_action,
         kp_scale=args.kp_scale,
         kd_scale=args.kd_scale,
@@ -816,9 +767,18 @@ def main():
         headless=args.headless,
         video_path=args.video_path,
         video_size=tuple(args.video_size),
+        video_ref=args.video_ref,
         sim_duration=args.sim_duration,
     )
-    controller.run()
+    # SIGTERM (e.g. from a batch script / docker stop) -> same clean shutdown as Ctrl+C,
+    # so the mp4 / proprio recordings still get flushed in run()'s finally block.
+    def _on_sigterm(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    try:
+        controller.run()
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
