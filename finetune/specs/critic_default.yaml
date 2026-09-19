@@ -1,0 +1,47 @@
+future_steps: 10
+future_interval: 5
+terms:
+# --- proprio (current frame only; the critic has no need for the 25-step history) ---
+- name: base_ang_vel
+  scale: 0.25
+  clip: [-100.0, 100.0]
+- name: base_roll_pitch
+  clip: [-100.0, 100.0]
+- name: joint_pos_rel
+  clip: [-100.0, 100.0]
+- name: joint_vel_rel
+  scale: 0.05
+  clip: [-100.0, 100.0]
+- name: last_action
+  clip: [-100.0, 100.0]
+# --- reference (same terms the actor sees, first future step) ---
+- name: future_motion_joint_pos
+  params: {num_steps: 1}
+- name: future_motion_root_lin_vel_pb
+  params: {num_steps: 1}
+- name: future_motion_root_ang_vel_b
+  params: {num_steps: 1}
+- name: future_motion_root_roll_pitch
+  params: {num_steps: 1}
+- name: future_motion_root_height
+  params: {num_steps: 1}
+- name: diff_body_pos_b
+  scale: 1.0
+  params: {randomize_motion_ref_xyz: true}
+# --- privileged (simulator only) ---
+- name: priv_root_lin_vel_b
+- name: priv_root_height
+- name: priv_projected_gravity
+- name: priv_ref_root_pos_diff_b
+- name: priv_ref_root_rot_diff
+- name: priv_ref_root_lin_vel_b
+- name: priv_ref_root_ang_vel_b
+- name: priv_body_pos_diff_b
+- name: priv_body_lin_vel_diff_b
+  scale: 0.5
+- name: priv_body_ang_vel_diff_b
+  scale: 0.25
+- name: priv_feet_contact
+- name: priv_joint_torque
+  params: {scale: 0.01}
+- name: priv_motion_phase
