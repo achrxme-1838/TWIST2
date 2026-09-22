@@ -5,10 +5,14 @@ import sys
 import time
 import os
 
-# --headless renders offscreen; MuJoCo picks its GL backend at import time, so
-# the env var has to be set before `import mujoco`.
+# --headless renders offscreen; MuJoCo picks its GL backend *and* its EGL device
+# at import time, so both env vars have to be set before `import mujoco`. The EGL
+# device list is not in CUDA order, so resolve the EGL index from the CUDA GPU
+# (CUDA_VISIBLE_DEVICES) instead of trusting a bare number -- see gl_device.py.
 if "--headless" in sys.argv:
     os.environ.setdefault("MUJOCO_GL", "egl")
+    from gl_device import select_egl_device_for_cuda
+    select_egl_device_for_cuda()
 
 import cv2
 import numpy as np

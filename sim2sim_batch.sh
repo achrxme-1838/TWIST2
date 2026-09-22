@@ -11,14 +11,16 @@ PY=/workspace/isaaclab/_isaac_sim/python.sh
 # motion_file=${MOTION:-${SCRIPT_DIR}/assets/LAAM/B3-walk1_poses.pkl}
 # motion_file=${MOTION:-${SCRIPT_DIR}/assets/LAAM/G2-Sidekick_leading_left_poses.pkl}
 # motion_file=${MOTION:-${SCRIPT_DIR}/assets/LAAM/G6-axe_kick_poses.pkl}
-# motion_file=${MOTION:-${SCRIPT_DIR}/assets/LAAM/Subject_69_F_21_poses.pkl}
-motion_file=${MOTION:-${SCRIPT_DIR}/assets/PHUMA/LAFAN1_walk1_subject1_chunk_0030.pkl}
+motion_file=${MOTION:-${SCRIPT_DIR}/assets/LAAM/Subject_69_F_21_poses.pkl}
+# motion_file=${MOTION:-${SCRIPT_DIR}/assets/PHUMA/LAFAN1_walk1_subject1_chunk_0030.pkl}
 
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+upcoming+diff-pos-b-deploy.onnx}
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+upcoming.onnx}
-ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+GMT+diff-pos-b-deploy_hist25_futu1.onnx}
-# ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+future-pos-h+future-anchor_hist10.onnx}
+# ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+GMT+diff-pos-b-deploy_hist25_futu1.onnx}
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+future-pos-h+future-anchor_hist15_futu1.onnx}
+# ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+GMT+diff-pos-b_hist25_futu1.onnx}
+# ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+GMT+diff-pos-b_hist10_futu1.onnx}
+ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+GMT+diff-pos-pb_hist25_futu1.onnx}
 
 video_path=${VIDEO:-}
 motion_args=("$@")
@@ -41,7 +43,7 @@ redis-cli flushall >/dev/null   # no stale targets / anchors from a previous run
 
 GPU=${GPU:-0}
 export CUDA_VISIBLE_DEVICES=${GPU}
-export MUJOCO_EGL_DEVICE_ID=${GPU}
+unset MUJOCO_EGL_DEVICE_ID
 
 export PYTHONNOUSERSITE=1
 unset PYTHONPATH

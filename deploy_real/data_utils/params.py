@@ -10,6 +10,7 @@ import numpy as np
 DEFAULT_MIMIC_OBS_G1 = np.concatenate([
                     np.array([0, 0]), # xy velocity (root-local)
                     np.array([0.7805]), # z position (A1-Stand frame-0 root height)
+                    # np.array([0.797]), # z position when robot's foot touches the ground
                     np.array([0, 0]), # roll/pitch
                     np.array([0]), # yaw (in robot's start-heading frame)
                     np.array([0, 0, 0]), # full angular velocity (root-local)
