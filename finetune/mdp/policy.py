@@ -37,14 +37,33 @@ def load_student_state(path: str, map_location="cpu") -> Dict[str, torch.Tensor]
     return out
 
 
-def student_from_state(state: Dict[str, torch.Tensor], activation: str = "elu") -> nn.Sequential:
-    """Rebuild the student nn.Sequential ([Linear, act]*n + Linear) from the state-dict shapes."""
-    idx = sorted({int(m.group(1)) for k in state if (m := re.match(r"student\.(\d+)\.weight", k))})
-    dims = [state[f"student.{i}.weight"].shape for i in idx]
+def mlp_from_state(state: Dict[str, torch.Tensor], prefix: str, activation: str = "elu") -> nn.Sequential:
+    """Rebuild an nn.Sequential MLP ([Linear, act]*n + Linear) from the ``<prefix>.<i>.weight``
+    shapes of a state dict and load its weights."""
+    pat = re.compile(re.escape(prefix) + r"\.(\d+)\.weight$")
+    idx = sorted({int(m.group(1)) for k in state if (m := pat.match(k))})
+    if not idx:
+        raise KeyError(f"no '{prefix}.<i>.weight' keys in state dict (found e.g. {list(state)[:5]})")
+    dims = [state[f"{prefix}.{i}.weight"].shape for i in idx]
     hidden = [d[0] for d in dims[:-1]]
     seq = build_mlp(dims[0][1], hidden, dims[-1][0], activation)
-    seq.load_state_dict({k[len("student."):]: v for k, v in state.items() if k.startswith("student.")})
+    seq.load_state_dict({k[len(prefix) + 1:]: v for k, v in state.items() if k.startswith(prefix + ".")})
     return seq
+
+
+def student_from_state(state: Dict[str, torch.Tensor], activation: str = "elu") -> nn.Sequential:
+    """Rebuild the student nn.Sequential ([Linear, act]*n + Linear) from the state-dict shapes."""
+    return mlp_from_state(state, "student", activation)
+
+
+def load_teacher_critic_state(path: str, map_location="cpu") -> Dict[str, torch.Tensor]:
+    """``critic.*`` tensors of a DEX_RL_LAB PPO (teacher) checkpoint."""
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    sd = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+    out = {k: v for k, v in sd.items() if k.startswith("critic.")}
+    if not out:
+        raise KeyError(f"{path}: no 'critic.*' keys (found e.g. {list(sd)[:5]}) -- not a PPO teacher checkpoint?")
+    return out
 
 
 class LoRAActorCritic(nn.Module):
@@ -52,10 +71,14 @@ class LoRAActorCritic(nn.Module):
 
     def __init__(self, student_state: Dict[str, torch.Tensor], num_critic_obs: int, num_actions: int,
                  lora_cfg: LoRACfg, critic_cfg: CriticCfg, init_noise_std: Optional[float] = 0.2,
-                 std_trainable: bool = True, activation: str = "elu"):
+                 std_trainable: bool = True, activation: str = "elu",
+                 critic_state: Optional[Dict[str, torch.Tensor]] = None):
         super().__init__()
         self.mode = lora_cfg.mode
         self.num_actions = num_actions
+        self.critic_source = critic_cfg.source
+        # scratch critics are fully trained; teacher critics follow critic_cfg.adapt
+        self.critic_mode = "fft" if critic_cfg.source == "scratch" else critic_cfg.adapt
 
         # ---- actor: pre-trained student ----
         self.actor = student_from_state(student_state, activation)
@@ -80,8 +103,22 @@ class LoRAActorCritic(nn.Module):
         self.std = nn.Parameter(std0, requires_grad=std_trainable)
         self._std_trainable = std_trainable
 
-        # ---- critic: from scratch ----
-        self.critic = build_mlp(num_critic_obs, list(critic_cfg.hidden_dims), 1, critic_cfg.activation)
+        # ---- critic: from scratch, or the teacher's (frozen W0 + LoRA / fft / frozen) ----
+        if critic_cfg.source == "scratch":
+            self.critic = build_mlp(num_critic_obs, list(critic_cfg.hidden_dims), 1, critic_cfg.activation)
+        else:
+            if critic_state is None:
+                raise ValueError("critic.source=teacher needs critic_state (load_teacher_critic_state)")
+            self.critic = mlp_from_state(critic_state, "critic", critic_cfg.activation)
+            if self.critic[0].in_features != num_critic_obs:
+                raise ValueError(
+                    f"teacher critic expects {self.critic[0].in_features} obs but the critic spec builds "
+                    f"{num_critic_obs} -- the spec must reproduce the teacher's critic observation group "
+                    f"(finetune/tasks/export_critic_spec.py)")
+            for p in self.critic.parameters():
+                p.requires_grad_(self.critic_mode == "fft")
+            if self.critic_mode == "lora":
+                inject_lora(self.critic, critic_cfg.lora_rank, critic_cfg.lora_alpha, critic_cfg.lora_a_init_std)
         self.distribution: Optional[Normal] = None
         Normal.set_default_validate_args(False)
 
@@ -93,7 +130,11 @@ class LoRAActorCritic(nn.Module):
             yield from self.actor.parameters()
 
     def critic_parameters(self) -> Iterator[nn.Parameter]:
-        return self.critic.parameters()
+        """Trainable critic parameters (all / LoRA only / none)."""
+        if self.critic_mode == "lora":
+            yield from lora_parameters(self.critic)
+        elif self.critic_mode == "fft":
+            yield from self.critic.parameters()
 
     def set_actor_trainable(self, flag: bool):
         for p in self.actor_trainable_parameters():
@@ -104,8 +145,10 @@ class LoRAActorCritic(nn.Module):
         n_actor = count_parameters(self.actor.parameters())
         n_train = count_parameters(self.actor_trainable_parameters())
         n_critic = count_parameters(self.critic.parameters())
+        n_critic_train = count_parameters(self.critic_parameters())
         return (f"actor: {n_actor} params, trainable {n_train} ({100.0 * n_train / max(n_actor, 1):.3f}%, mode={self.mode})"
-                f" | critic: {n_critic} params | std init mean {self.std.mean().item():.3f}")
+                f" | critic ({self.critic_source}, {self.critic_mode}): {n_critic} params, trainable {n_critic_train}"
+                f" | std init mean {self.std.mean().item():.3f}")
 
     # ----- rsl_rl policy API -----
     def reset(self, dones=None):
@@ -147,6 +190,9 @@ class LoRAActorCritic(nn.Module):
     def merged_actor(self) -> nn.Sequential:
         """Plain nn.Sequential with W0 + (alpha/r) B A folded in (deploy / ONNX)."""
         return merge_lora(self.actor) if self.mode == "lora" else __import__("copy").deepcopy(self.actor)
+
+    def merged_critic(self) -> nn.Sequential:
+        return merge_lora(self.critic) if self.critic_mode == "lora" else __import__("copy").deepcopy(self.critic)
 
     def lora_state(self) -> Dict[str, torch.Tensor]:
         return {k: v for k, v in self.state_dict().items() if "lora_" in k}

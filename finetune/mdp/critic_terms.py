@@ -125,3 +125,71 @@ def priv_joint_torque(c: TrainObsContext, params: dict) -> np.ndarray:
 def priv_motion_phase(c: TrainObsContext, params: dict) -> np.ndarray:
     c._req()
     return np.array([c.motion_phase, min(c.time_left, 5.0) / 5.0], dtype=np.float32)
+
+
+# --------------------------------------------------------------------------- teacher critic terms
+# Deploy implementations of the IsaacLab critic observation group of the DEX_RL_LAB teacher
+# (g1_29dof_mapo: robot_observations.projected_gravity, mimic_observations.extended_body_*_h,
+# diff_body_{lin,ang}_vel_pb). Needed when critic.source=teacher so the teacher's critic
+# weights see the observation layout they were trained on. Conventions:
+#   *_h  : heading frame  = calc_heading_quat_inv(root_quat)   (x-axis heading, yaw only)
+#   *_pb : planar base    = planar_root_quat_w (euler-xyz yaw of the root, roll/pitch zeroed)
+
+def _heading_inv(c: TrainObsContext) -> np.ndarray:
+    return heading_quat_from_quat(c.robot.root_quat, inverse=True)
+
+
+def _planar_inv(c: TrainObsContext) -> np.ndarray:
+    yaw = float(c.rpy[2])
+    return np.array([np.cos(0.5 * yaw), 0.0, 0.0, -np.sin(0.5 * yaw)], dtype=np.float64)
+
+
+def _rotate_rows(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    return quat_apply(np.broadcast_to(q, (v.shape[0], 4)), v)
+
+
+@term("projected_gravity", dim=lambda s, p: 3)
+def projected_gravity(c: TrainObsContext, params: dict) -> np.ndarray:
+    c._req()
+    return projected_gravity_b(c.robot.root_quat).astype(np.float32)
+
+
+@term("extended_body_pos_h", dim=lambda s, p: s.num_bodies * 3)
+def extended_body_pos_h(c: TrainObsContext, params: dict) -> np.ndarray:
+    c._req()
+    rel = c.robot.body_pos - c.robot.root_pos[None, :]
+    return _rotate_rows(_heading_inv(c), rel).astype(np.float32).reshape(-1)
+
+
+@term("extended_body_quat_h", dim=lambda s, p: s.num_bodies * 4)
+def extended_body_quat_h(c: TrainObsContext, params: dict) -> np.ndarray:
+    c._req()
+    q = c.robot.body_quat
+    return quat_mul(np.broadcast_to(_heading_inv(c), q.shape), q).astype(np.float32).reshape(-1)
+
+
+@term("extended_body_lin_vel_h", dim=lambda s, p: s.num_bodies * 3)
+def extended_body_lin_vel_h(c: TrainObsContext, params: dict) -> np.ndarray:
+    c._req()
+    return _rotate_rows(_heading_inv(c), c.robot.body_lin_vel_ext).astype(np.float32).reshape(-1)
+
+
+@term("extended_body_ang_vel_h", dim=lambda s, p: s.num_bodies * 3)
+def extended_body_ang_vel_h(c: TrainObsContext, params: dict) -> np.ndarray:
+    c._req()
+    return _rotate_rows(_heading_inv(c), c.robot.body_ang_vel_ext).astype(np.float32).reshape(-1)
+
+
+@term("diff_body_lin_vel_pb", dim=lambda s, p: s.num_bodies * 3)
+def diff_body_lin_vel_pb(c: TrainObsContext, params: dict) -> np.ndarray:
+    """(ref - robot) extended-body linear velocity in the planar base frame (current motion time)."""
+    c._req()
+    diff = c.ref.lin_vel_ext - c.robot.body_lin_vel_ext
+    return _rotate_rows(_planar_inv(c), diff).astype(np.float32).reshape(-1)
+
+
+@term("diff_body_ang_vel_pb", dim=lambda s, p: s.num_bodies * 3)
+def diff_body_ang_vel_pb(c: TrainObsContext, params: dict) -> np.ndarray:
+    c._req()
+    diff = c.ref.ang_vel_ext - c.robot.body_ang_vel_ext
+    return _rotate_rows(_planar_inv(c), diff).astype(np.float32).reshape(-1)

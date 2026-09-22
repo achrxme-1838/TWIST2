@@ -31,6 +31,10 @@ class RobotState:
     body_lin_vel: np.ndarray    # [B, 3] tracked, world (link frame origin)
     body_ang_vel: np.ndarray    # [B, 3] tracked, world
     contact_force: np.ndarray   # [nbody] max net contact force norm over the substeps
+    # [B_ext, 3] tracked + extended; an extended body moves with its parent
+    # (DEX extending_body_lin_vel_w / extending_body_ang_vel_w, HOVER convention).
+    body_lin_vel_ext: np.ndarray = None
+    body_ang_vel_ext: np.ndarray = None
 
 
 class G1SimCore:
@@ -72,6 +76,9 @@ class G1SimCore:
         self.extended_local_offsets = np.array([o for _, _, o in cfg.EXTENDED_JOINTS], dtype=np.float64)
         self.num_tracked = len(self.tracked_body_ids)
         self.pelvis_id = int(self.tracked_body_ids[0])
+        # index of each extended body's parent within the tracked list (velocity inheritance)
+        tracked = self.tracked_body_ids.tolist()
+        self.extended_parent_tracked_idx = np.array([tracked.index(int(p)) for p in self.extended_parent_ids], dtype=np.int64)
 
         # Private MjData for FK on the reference frames (diff_body_* / future_motion_* terms).
         self.ref_data = mujoco.MjData(self.model)
@@ -198,4 +205,6 @@ class G1SimCore:
             body_lin_vel=lin,
             body_ang_vel=ang,
             contact_force=self._contact_max.copy(),
+            body_lin_vel_ext=np.concatenate([lin, lin[self.extended_parent_tracked_idx]], axis=0),
+            body_ang_vel_ext=np.concatenate([ang, ang[self.extended_parent_tracked_idx]], axis=0),
         )

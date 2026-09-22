@@ -13,20 +13,37 @@ class PathsCfg:
     name: str = "prop5+GMT+diff-pos-b_hist25_futu1"
     student_pt: str = ""       # default: assets/pt/<name>.pt
     actor_spec: str = ""       # default: assets/pt/<name>.yaml, then assets/ckpts/<name>.yaml
-    critic_spec: str = os.path.join(TWIST2_ROOT, "finetune", "specs", "critic_default.yaml")
+    critic_spec: str = ""      # default by critic.source: specs/critic_default.yaml (scratch) / critic_teacher.yaml (teacher)
     motion_file: str = ""      # integrated joblib pkl (many motions) -- required
     xml: str = os.path.join(TWIST2_ROOT, "assets", "g1", "g1_sim2sim_29dof.xml")
     log_root: str = os.path.join(TWIST2_ROOT, "logs", "finetune")
-    export_dir: str = os.path.join(TWIST2_ROOT, "assets", "ckpts")
+    export_dir: str = os.path.join(TWIST2_ROOT, "assets", "ckpts")              # ONNX (+ spec) for the deploy servers
+    export_pt_dir: str = os.path.join(TWIST2_ROOT, "assets", "pt_finetuned")    # rsl_rl .pt for IsaacLab play.py
     rsl_rl_root: Optional[str] = None   # DEX_RL_LAB_PHUMA dir; None -> auto (see _paths.py)
 
-    def resolve(self):
+    def resolve(self, critic_source: str = "scratch"):
         pt_dir = os.path.join(TWIST2_ROOT, "assets", "pt")
+        ckpt_dir = os.path.join(TWIST2_ROOT, "assets", "ckpts")
+        if not self.critic_spec:
+            fname = "critic_teacher.yaml" if critic_source == "teacher" else "critic_default.yaml"
+            self.critic_spec = os.path.join(TWIST2_ROOT, "finetune", "specs", fname)
+        if self.student_pt and not self.actor_spec:
+            # An explicit student .pt names its own spec (<dir>/<stem>.yaml, then assets/ckpts/
+            # <stem>.yaml). Never fall back to ``name`` here: a wrong spec with the same obs
+            # width (e.g. diff_body_pos_b vs diff_body_pos_b_deploy) is not caught by the dim
+            # check and silently breaks the policy.
+            stem = os.path.splitext(os.path.basename(self.student_pt))[0]
+            for cand in (os.path.join(os.path.dirname(os.path.abspath(self.student_pt)), f"{stem}.yaml"),
+                         os.path.join(pt_dir, f"{stem}.yaml"), os.path.join(ckpt_dir, f"{stem}.yaml")):
+                if os.path.isfile(cand):
+                    self.actor_spec = cand
+                    if self.name == PathsCfg.name:
+                        self.name = stem
+                    break
         if not self.student_pt:
             self.student_pt = os.path.join(pt_dir, f"{self.name}.pt")
         if not self.actor_spec:
-            for cand in (os.path.join(pt_dir, f"{self.name}.yaml"),
-                         os.path.join(TWIST2_ROOT, "assets", "ckpts", f"{self.name}.yaml")):
+            for cand in (os.path.join(pt_dir, f"{self.name}.yaml"), os.path.join(ckpt_dir, f"{self.name}.yaml")):
                 if os.path.isfile(cand):
                     self.actor_spec = cand
                     break
@@ -99,10 +116,16 @@ class LoRACfg:
 
 @dataclass
 class CriticCfg:
-    hidden_dims: List[int] = field(default_factory=lambda: [512, 256, 128])
+    source: str = "scratch"             # scratch / teacher
+    teacher_ckpt: str = ""
+    adapt: str = "lora"                 # teacher critic: lora / fft / frozen
+    lora_rank: int = 1
+    lora_alpha: float = 1.0
+    lora_a_init_std: Optional[float] = None
+    hidden_dims: List[int] = field(default_factory=lambda: [512, 256, 128])   # scratch only
     activation: str = "elu"
     lr: float = 1e-3
-    warmup_iters: int = 200
+    warmup_iters: int = 200             # critic-only iterations before the actor is unfrozen
 
 
 @dataclass
@@ -117,15 +140,16 @@ class PPOCfg:
     entropy_coef: float = 0.01
     use_clipped_value_loss: bool = True
     max_grad_norm: float = 1.0
-    schedule: str = "fixed"
+    schedule: str = "adaptive"          # adaptive / fixed
     desired_kl: float = 0.01
+    adaptive_groups: List[str] = field(default_factory=lambda: ["actor", "std"])
     normalize_advantage_per_mini_batch: bool = False
 
 
 @dataclass
 class TrainCfg:
     max_iterations: int = 3000
-    save_interval: int = 100
+    save_interval: int = 500
     log_interval: int = 1
     device: str = "cpu"
     init_noise_std: Optional[float] = 0.2
@@ -147,7 +171,15 @@ class FinetuneCfg:
     train: TrainCfg = field(default_factory=TrainCfg)
 
     def resolve(self) -> "FinetuneCfg":
-        self.paths.resolve()
+        if self.critic.source not in ("scratch", "teacher"):
+            raise ValueError(f"critic.source must be scratch or teacher, got {self.critic.source!r}")
+        if self.critic.source == "teacher" and not self.critic.teacher_ckpt:
+            raise ValueError("critic.source=teacher needs critic.teacher_ckpt (DEX_RL_LAB model_N.pt)")
+        if self.critic.adapt not in ("lora", "fft", "frozen"):
+            raise ValueError(f"critic.adapt must be lora, fft or frozen, got {self.critic.adapt!r}")
+        if self.ppo.schedule not in ("adaptive", "fixed"):
+            raise ValueError(f"ppo.schedule must be adaptive or fixed, got {self.ppo.schedule!r}")
+        self.paths.resolve(self.critic.source)
         return self
 
     def to_dict(self) -> dict:

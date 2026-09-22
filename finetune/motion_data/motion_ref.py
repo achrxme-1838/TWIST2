@@ -34,6 +34,8 @@ class RefBodyState:
     quat: np.ndarray            # [B_ext, 4] wxyz
     lin_vel: np.ndarray         # [B, 3] tracked bodies only, world
     ang_vel: np.ndarray         # [B, 3] tracked bodies only, world
+    lin_vel_ext: np.ndarray = None   # [B_ext, 3] tracked + extended (DEX body_lin_vel_extend)
+    ang_vel_ext: np.ndarray = None   # [B_ext, 3]
 
 
 class RefFK:
@@ -229,13 +231,14 @@ class MotionSet:
         pos, quat = self.fk.body_pose(fr.root_pos, fr.root_quat, fr.dof_pos)
         t0 = max(0.0, t - h)
         t1 = min(m.length, t + h)
+        n = self.fk.num_tracked
         if t1 - t0 < 1e-9:
-            return RefBodyState(pos, quat, np.zeros((self.fk.num_tracked, 3)), np.zeros((self.fk.num_tracked, 3)))
+            z = np.zeros((pos.shape[0], 3))
+            return RefBodyState(pos, quat, z[:n], z[:n], z, z)
         fa = self.frame(mid, t0)
         fb = self.frame(mid, t1)
         pa, qa = self.fk.body_pose(fa.root_pos, fa.root_quat, fa.dof_pos)
         pb, qb = self.fk.body_pose(fb.root_pos, fb.root_quat, fb.dof_pos)
-        n = self.fk.num_tracked
-        lin_vel = (pb[:n] - pa[:n]) / (t1 - t0)
-        ang_vel = quat_to_exp_map(quat_mul(qb[:n], quat_conj(qa[:n]))) / (t1 - t0)
-        return RefBodyState(pos, quat, lin_vel, ang_vel)
+        lin_vel_ext = (pb - pa) / (t1 - t0)
+        ang_vel_ext = quat_to_exp_map(quat_mul(qb, quat_conj(qa))) / (t1 - t0)
+        return RefBodyState(pos, quat, lin_vel_ext[:n], ang_vel_ext[:n], lin_vel_ext, ang_vel_ext)

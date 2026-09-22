@@ -16,6 +16,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 from finetune.tasks.ft_cfg import FinetuneCfg, apply_overrides  # noqa: E402
+from finetune.tasks.optim import bind_scaled_groups, gaussian_kl, group_lrs, make_param_groups  # noqa: E402
 
 
 def build_parser():
@@ -52,11 +53,12 @@ def make_cfg(args) -> FinetuneCfg:
     cfg.resolve()
     if not cfg.paths.motion_file:
         raise SystemExit("--motion (paths.motion_file) is required")
-    for f in (cfg.paths.student_pt, cfg.paths.actor_spec, cfg.paths.critic_spec, cfg.paths.motion_file, cfg.paths.xml):
+    files = [cfg.paths.student_pt, cfg.paths.actor_spec, cfg.paths.critic_spec, cfg.paths.motion_file, cfg.paths.xml]
+    if cfg.critic.source == "teacher":
+        files.append(cfg.critic.teacher_ckpt)
+    for f in files:
         if not os.path.isfile(f):
             raise SystemExit(f"missing file: {f}")
-    if cfg.ppo.schedule != "fixed":
-        raise SystemExit("ppo.schedule must be 'fixed' (adaptive KL overwrites the per-group learning rates)")
     return cfg
 
 
@@ -92,24 +94,28 @@ class Logger:
 
 def build_optimizer(policy, cfg: FinetuneCfg):
     actor_lr = cfg.lora.lr if cfg.lora.mode == "lora" else cfg.lora.fft_lr
-    groups = []
-    actor_params = list(policy.actor_trainable_parameters())
-    if actor_params:
-        groups.append({"params": actor_params, "lr": actor_lr, "name": "actor"})
-    if policy.std.requires_grad or cfg.train.std_trainable:
-        groups.append({"params": [policy.std], "lr": cfg.train.std_lr or actor_lr, "name": "std"})
-    groups.append({"params": list(policy.critic_parameters()), "lr": cfg.critic.lr, "name": "critic"})
-    return torch.optim.Adam(groups)
+    named = [("actor", policy.actor_trainable_parameters(), actor_lr)]
+    if cfg.train.std_trainable:
+        named.append(("std", [policy.std], cfg.train.std_lr or actor_lr))
+    named.append(("critic", policy.critic_parameters(), cfg.critic.lr))
+    groups = make_param_groups(named)
+    if not any(g["name"] == "actor" for g in groups):
+        raise SystemExit("no trainable actor parameters (lora.mode=frozen?)")
+    opt = torch.optim.Adam(groups)
+    bind_scaled_groups(opt, ref_group="actor", follow_groups=cfg.ppo.adaptive_groups)
+    return opt, actor_lr
 
 
-def save_checkpoint(path: str, policy, optimizer, it: int, cfg: FinetuneCfg):
+def save_checkpoint(path: str, policy, optimizer, it: int, cfg: FinetuneCfg, learning_rate: float):
     torch.save({
         "iter": it,
         "cfg": cfg.to_dict(),
         "model_state_dict": policy.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "merged_actor_state_dict": policy.merged_actor().state_dict(),
+        "merged_critic_state_dict": policy.merged_critic().state_dict(),
         "std": policy.std.detach().cpu(),
+        "learning_rate": learning_rate,
     }, path)
 
 
@@ -119,7 +125,7 @@ def main():
     _paths.setup(cfg.paths.rsl_rl_root)
 
     from finetune.env.mujoco_env import G1MimicVecEnv
-    from finetune.mdp.policy import LoRAActorCritic, load_student_state
+    from finetune.mdp.policy import LoRAActorCritic, load_student_state, load_teacher_critic_state
     from rsl_rl.algorithms import PPO
 
     torch.manual_seed(cfg.env.seed)
@@ -135,23 +141,26 @@ def main():
 
     env = G1MimicVecEnv(cfg, device=device)
     student_state = load_student_state(cfg.paths.student_pt)
+    critic_state = load_teacher_critic_state(cfg.critic.teacher_ckpt) if cfg.critic.source == "teacher" else None
     policy = LoRAActorCritic(student_state, env.num_critic_obs, env.num_actions, cfg.lora, cfg.critic,
-                             init_noise_std=cfg.train.init_noise_std, std_trainable=cfg.train.std_trainable).to(device)
+                             init_noise_std=cfg.train.init_noise_std, std_trainable=cfg.train.std_trainable,
+                             critic_state=critic_state).to(device)
     if policy.num_actor_obs != env.num_actor_obs:
         raise SystemExit(f"student expects {policy.num_actor_obs} obs but the actor spec builds {env.num_actor_obs}")
     print("[policy] " + policy.summary())
 
+    optimizer, actor_lr = build_optimizer(policy, cfg)   # separate LoRA / std / critic learning rates
     ppo_kwargs = dict(
         num_learning_epochs=cfg.ppo.num_learning_epochs, num_mini_batches=cfg.ppo.num_mini_batches,
         clip_param=cfg.ppo.clip_param, gamma=cfg.ppo.gamma, lam=cfg.ppo.lam,
         value_loss_coef=cfg.ppo.value_loss_coef, entropy_coef=cfg.ppo.entropy_coef,
-        learning_rate=cfg.critic.lr, max_grad_norm=cfg.ppo.max_grad_norm,
+        learning_rate=actor_lr, max_grad_norm=cfg.ppo.max_grad_norm,
         use_clipped_value_loss=cfg.ppo.use_clipped_value_loss, schedule=cfg.ppo.schedule,
         desired_kl=cfg.ppo.desired_kl, normalize_advantage_per_mini_batch=cfg.ppo.normalize_advantage_per_mini_batch,
         device=device,
     )
     alg = PPO(policy, **ppo_kwargs)
-    alg.optimizer = build_optimizer(policy, cfg)   # separate LoRA / std / critic learning rates
+    alg.optimizer = optimizer
     alg.init_storage("rl", env.num_envs, cfg.ppo.num_steps_per_env,
                      [env.num_actor_obs], [env.num_critic_obs], [env.num_actions])
 
@@ -160,6 +169,10 @@ def main():
         ck = torch.load(cfg.train.resume, map_location=device, weights_only=False)
         policy.load_state_dict(ck["model_state_dict"])
         alg.optimizer.load_state_dict(ck["optimizer_state_dict"])
+        bind_scaled_groups(alg.optimizer, ref_group="actor", follow_groups=cfg.ppo.adaptive_groups)
+        alg.learning_rate = float(ck.get("learning_rate", actor_lr))
+        for g in alg.optimizer.param_groups:
+            g["lr"] = alg.learning_rate
         start_it = int(ck.get("iter", 0)) + 1
         print(f"[train] resumed from {cfg.train.resume} @ iter {start_it}")
 
@@ -174,6 +187,7 @@ def main():
     for it in range(start_it, cfg.train.max_iterations):
         warmup = it < cfg.critic.warmup_iters
         policy.set_actor_trainable(not warmup)
+        alg.schedule = "fixed" if warmup else cfg.ppo.schedule
         t_iter = time.time()
         rew_sum = 0.0
         with torch.inference_mode():
@@ -190,7 +204,18 @@ def main():
                         ep_terms[k].append(v)
             alg.compute_returns(critic_obs)
         t_collect = time.time() - t_iter
+        st = alg.storage
+        # critic quality on this rollout, before the update: 1 - Var(R - V) / Var(R)
+        # (0 = as good as predicting the mean return, 1 = perfect; unlike the value loss
+        # this is independent of the return scale)
+        ret, val = st.returns.flatten(), st.values.flatten()
+        explained_var = float(1.0 - torch.var(ret - val) / torch.var(ret).clamp_min(1e-8))
+        kl_obs = st.observations.flatten(0, 1)
+        kl_old_mu, kl_old_sigma = st.mu.flatten(0, 1).clone(), st.sigma.flatten(0, 1).clone()
         losses = alg.update()
+        with torch.inference_mode():
+            policy.update_distribution(kl_obs)
+            kl = gaussian_kl(kl_old_mu, kl_old_sigma, policy.action_mean, policy.action_std)
         t_learn = time.time() - t_iter - t_collect
         total_steps += steps_per_iter
 
@@ -198,8 +223,10 @@ def main():
             fps = steps_per_iter / max(t_collect + t_learn, 1e-9)
             scalars = {
                 "Loss/value_function": losses["value_function"],
+                "Loss/explained_variance": explained_var,
                 "Loss/surrogate": losses["surrogate"],
                 "Loss/entropy": losses["entropy"],
+                "Policy/kl": kl,
                 "Policy/mean_noise_std": float(policy.std.mean()),
                 "Policy/actor_trainable": float(not warmup),
                 "Train/mean_step_reward": rew_sum / steps_per_iter,
@@ -208,8 +235,8 @@ def main():
                 "Train/collect_time": t_collect,
                 "Train/learn_time": t_learn,
             }
-            for g in alg.optimizer.param_groups:
-                scalars[f"Train/lr_{g.get('name', '?')}"] = g["lr"]
+            for name, lr in group_lrs(alg.optimizer).items():
+                scalars[f"Train/lr_{name}"] = lr
             if ep_rew:
                 scalars.update({
                     "Episode/mean_reward": statistics.fmean(ep_rew),
@@ -226,11 +253,12 @@ def main():
                   f"| ep_rew {scalars.get('Episode/mean_reward', float('nan')):8.3f} "
                   f"| ep_len {scalars.get('Episode/mean_length', float('nan')):6.1f} "
                   f"| div {scalars.get('Episode/diverged_rate', float('nan')):.2f} "
-                  f"| vloss {losses['value_function']:.4f} | sloss {losses['surrogate']:.4f} "
+                  f"| vloss {losses['value_function']:.4f} ev {explained_var:.2f} | sloss {losses['surrogate']:.4f} "
+                  f"| kl {kl:.4f} | lr {alg.learning_rate:.1e} "
                   f"| std {scalars['Policy/mean_noise_std']:.3f} | fps {fps:6.0f} | {time.time() - t_start:6.0f}s")
 
         if (it + 1) % cfg.train.save_interval == 0 or it + 1 == cfg.train.max_iterations:
-            save_checkpoint(os.path.join(run_dir, f"model_{it + 1}.pt"), policy, alg.optimizer, it, cfg)
+            save_checkpoint(os.path.join(run_dir, f"model_{it + 1}.pt"), policy, alg.optimizer, it, cfg, alg.learning_rate)
 
     logger.close()
     print(f"[train] done. checkpoints in {run_dir}; export with finetune/tasks/export.py --ckpt <model_N.pt>")

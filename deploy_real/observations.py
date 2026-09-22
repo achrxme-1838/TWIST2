@@ -113,6 +113,58 @@ def compute_diff_body_pos_b(
     return (diff_w @ R).astype(np.float32).reshape(-1)
 
 
+def compute_diff_body_pos_pb(
+    model, data, ref_data, action_mimic,
+    tracked_body_ids, extended_parent_ids, extended_local_offsets,
+    num_actions, z_align=False,
+    update_robot_w_odom=False, ref_root_xy_w=None,
+):
+    """Per-body world position diff (ref - robot) in the planar (yaw-only) base frame.
+
+    DEX: mimic_observations.diff_body_pos_pb. Isaac takes the world-frame diff
+    including the root translation, optionally removes the pelvis z mismatch from
+    every body (``z_align``), then rotates with the planar root quat.
+
+    Default (update_robot_w_odom=False): no robot world position is available, so
+    the root translation is cancelled on all axes by subtracting each side's pelvis
+    (index 0) before diffing -- the ``diff_body_pos_b_deploy`` convention in the
+    planar frame. ``z_align`` is implied here since the pelvis z is already gone.
+
+    update_robot_w_odom=True: ref and robot share the odom world frame (caller
+    drives ``data`` with the odom root, ref root placed at ``ref_root_xy_w``), so
+    the diff keeps the root xy translation error. ``z_align=True`` then removes
+    only the (ref_pelvis_z - robot_pelvis_z) term, exactly as Isaac does;
+    ``z_align=False`` keeps the absolute height error as well.
+
+    Isaac's ``randomize_motion_ref_xyz`` is train-time domain randomization with
+    no deploy counterpart (offset = 0). Returns flat [(N+E)*3] float32.
+    """
+    _drive_ref_data(
+        model, ref_data, action_mimic, num_actions,
+        ref_root_xy_w=ref_root_xy_w if update_robot_w_odom else None,
+    )
+
+    ref_pos_w = compute_extended_body_pos_w(
+        ref_data, tracked_body_ids, extended_parent_ids, extended_local_offsets
+    )
+    robot_pos_w = compute_extended_body_pos_w(
+        data, tracked_body_ids, extended_parent_ids, extended_local_offsets
+    )
+
+    diff_w = ref_pos_w - robot_pos_w
+    if not update_robot_w_odom:
+        # Root translation is unobservable without odometry: cancel it on every axis.
+        diff_w = diff_w - diff_w[0:1]
+    elif z_align:
+        # Isaac z_align: drop the pelvis z mismatch, keep the xy translation error.
+        diff_w = diff_w.copy()
+        diff_w[:, 2] -= diff_w[0, 2]
+
+    # v_pb = R_planar.T @ v_w == v_w @ R_planar.
+    R = planar_rot_matrix(yaw_from_quat(data.qpos[3:7]))
+    return (diff_w @ R).astype(np.float32).reshape(-1)
+
+
 def compute_diff_body_tannorm_b(
     model, data, ref_data, action_mimic,
     tracked_body_ids, extended_parent_ids,

@@ -9,6 +9,7 @@ import numpy as np
 
 from observations import (
     compute_diff_body_pos_b,
+    compute_diff_body_pos_pb,
     compute_diff_body_tannorm_b,
     compute_future_body_pos_w,
     compute_future_motion_anchor,
@@ -231,6 +232,21 @@ def diff_body_pos_b(c: ObsContext, params: dict) -> np.ndarray:
         s.model, c.data, c.ref_data, c.action_mimic,
         s.tracked_body_ids, s.extended_parent_ids, s.extended_local_offsets,
         s.num_actions, use_pb=False,
+        update_robot_w_odom=c.odom_on, ref_root_xy_w=c.ref_root_xy_w,
+    )
+
+
+# DEX: mimic_observations.diff_body_pos_pb
+
+@term("diff_body_pos_pb", dim=lambda s, p: s.num_bodies * 3)
+def diff_body_pos_pb(c: ObsContext, params: dict) -> np.ndarray:
+    c._require_ref()
+    s = c.static
+    # ``randomize_motion_ref_xyz`` / ``extending_cfg`` in params are train-side only.
+    return compute_diff_body_pos_pb(
+        s.model, c.data, c.ref_data, c.action_mimic,
+        s.tracked_body_ids, s.extended_parent_ids, s.extended_local_offsets,
+        s.num_actions, z_align=bool(params.get("z_align", False)),
         update_robot_w_odom=c.odom_on, ref_root_xy_w=c.ref_root_xy_w,
     )
 

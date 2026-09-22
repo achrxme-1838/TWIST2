@@ -80,6 +80,7 @@ class G1MimicVecEnv(VecEnv):
 
         self.rng = np.random.default_rng(ec.seed)
         self.force_motion_id: Optional[int] = None   # evaluation: pin every reset to one motion
+        self.auto_reset = True                        # False: leave a done slot as is (caller resets)
         self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._obs = torch.zeros(self.num_envs, self.num_actor_obs, device=self.device)
         self._critic_obs = torch.zeros(self.num_envs, self.num_critic_obs, device=self.device)
@@ -95,9 +96,6 @@ class G1MimicVecEnv(VecEnv):
 
     # ------------------------------------------------------------------ VecEnv API
     def get_observations(self):
-        # Fresh tensors every call: rsl_rl's PPO keeps a *reference* to the obs it acted on
-        # and only copies it into the rollout storage after env.step(), so the buffers
-        # must not be updated in place underneath it.
         obs = self._obs.clone()
         return obs, {"observations": {"critic": self._critic_obs.clone()}}
 
@@ -153,9 +151,10 @@ class G1MimicVecEnv(VecEnv):
                     "mean_max_body_dist": slot.ep_dist_sum / max(slot.step_count, 1),
                     "terms": dict(slot.ep_terms),
                 })
-                self._reset_slot(slot)
-                ref_frame, ref_body = self._ref_now(slot)
-                robot = None
+                if self.auto_reset:
+                    self._reset_slot(slot)
+                    ref_frame, ref_body = self._ref_now(slot)
+                    robot = None
             self._write_obs(i, slot, ref_frame, ref_body, robot)
 
         self.episode_length_buf = torch.tensor([s.step_count for s in self.slots], dtype=torch.long, device=self.device)

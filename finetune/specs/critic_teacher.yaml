@@ -1,0 +1,31 @@
+future_steps: 10
+future_interval: 5
+terms:
+- name: joint_pos_rel
+  clip: [-100.0, 100.0]
+- name: joint_vel_rel
+  scale: 0.05
+  clip: [-100.0, 100.0]
+- name: base_ang_vel
+  scale: 0.2
+  clip: [-100.0, 100.0]
+- name: projected_gravity
+  clip: [-100.0, 100.0]
+- name: last_action
+  clip: [-100.0, 100.0]
+- {name: extended_body_pos_h, scale: 1.0}
+- {name: extended_body_quat_h, scale: 1.0}
+- {name: extended_body_lin_vel_h, scale: 1.0}
+- {name: extended_body_ang_vel_h, scale: 1.0}
+- name: future_motion_pos_h
+  params: {num_steps: 10}
+- name: future_motion_anchor
+  params: {num_steps: 10}
+- name: diff_body_pos_b
+  scale: 1.0
+  params: {randomize_motion_ref_xyz: true}
+- {name: diff_body_tannorm_pb, scale: 1.0}
+- {name: diff_body_lin_vel_pb, scale: 1.0}
+- {name: diff_body_ang_vel_pb, scale: 1.0}
+source_run: PHUMA_rt-v30_ap0.99_2026-08-21_06-59-55
+obs_dim: 2067
