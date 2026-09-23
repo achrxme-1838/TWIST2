@@ -45,6 +45,16 @@ ANKLE_JOINT_NAMES = (
 # Robot init pose (SDK order). Mirrors g1_29dof_beyond_mimic_cfg init_state.joint_pos.
 # Used as the JointPositionAction default offset (use_default_offset=True) and the
 # joint_pos_rel observation reference, so it must match training exactly.
+# A1 - stand
+DEFAULT_DOF_POS_STAND = np.array([
+    0.0439, -0.0396, -0.0196, -0.0385, -0.1205, 0.0221,                 # left leg
+    0.0306, -0.0033, -0.1691, 0.0109, -0.0917, 0.1091,                  # right leg
+    -0.0004, -0.0365, -0.0608,                                          # waist yaw/roll/pitch
+    -0.0090, 0.1574, -0.2743, 1.1622, 0.0456, -0.1705, -0.0969,         # left arm
+    -0.0722, -0.1758, 0.4069, 1.1640, -0.0873, -0.1338, 0.1233,         # right arm
+])
+
+# squat - isaac lab initial state
 DEFAULT_DOF_POS = np.array([
     -0.312, 0.0, 0.0, 0.669, -0.363, 0.0,     # left leg
     -0.312, 0.0, 0.0, 0.669, -0.363, 0.0,     # right leg
