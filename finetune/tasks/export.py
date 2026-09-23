@@ -147,8 +147,10 @@ def main():
         out = build_student_pt(ck, cfg["paths"]["student_pt"])
         out["finetune"]["finetune_ckpt"] = os.path.abspath(args.ckpt)
         torch.save(out, pt_path)
+        shutil.copyfile(cfg["paths"]["actor_spec"], os.path.join(pt_dir, f"{name}.yaml"))
         err = verify_student_pt(pt_path, actor)
-        print(f"[export] pt   : {pt_path}\n[export]        max |student(pt) - merged actor| = {err:.2e}")
+        print(f"[export] pt   : {pt_path}\n[export] spec : {os.path.join(pt_dir, f'{name}.yaml')}"
+              f"\n[export]        max |student(pt) - merged actor| = {err:.2e}")
         if args.into_run is not None:
             run_dir = resolve_run_dir(args.into_run or None, cfg["paths"]["actor_spec"], cfg["paths"].get("rsl_rl_root"))
             dst = os.path.join(run_dir, f"model_ft{ft_iter}.pt")

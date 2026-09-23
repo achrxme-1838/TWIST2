@@ -214,6 +214,12 @@ def main():
     actor, kind = load_actor(cfg.paths.student_pt)
     env = G1MimicVecEnv(cfg, verbose=False)
     env.auto_reset = False
+    if actor[0].in_features != env.num_actor_obs:
+        raise SystemExit(
+            f"obs mismatch: the policy expects {actor[0].in_features} observations but\n"
+            f"  {cfg.paths.actor_spec}\nbuilds {env.num_actor_obs}. That spec belongs to a different "
+            f"policy -- pass the right one with --actor-spec (an exported policy's spec sits next to "
+            f"its .pt / .onnx).")
     n_motions = env.motions.num_motions
     print(f"[eval] {kind} from {cfg.paths.student_pt}")
     print(f"[eval] actor spec: {cfg.paths.actor_spec}")

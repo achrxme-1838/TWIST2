@@ -24,14 +24,21 @@ def add_cfg_args(p, policy_arg: str = "student"):
 
 
 def spec_from_finetune_ckpt(path: str):
-    """actor_spec recorded in a finetune checkpoint's cfg; None for a plain student .pt."""
+    """actor_spec recorded in a checkpoint: a finetune ``model_N.pt`` (train.py) or an exported
+    student ``.pt`` (tasks/export.py, which stores it under ``finetune``). None for a plain
+    distillation student."""
     import torch
     try:
         ck = torch.load(path, map_location="cpu", weights_only=False)
     except Exception:
         return None
-    if isinstance(ck, dict) and "merged_actor_state_dict" in ck:
-        return ck.get("cfg", {}).get("paths", {}).get("actor_spec") or None
+    if not isinstance(ck, dict):
+        return None
+    for cfg in (ck.get("cfg") if "merged_actor_state_dict" in ck else None,
+                (ck.get("finetune") or {}).get("cfg")):
+        spec = ((cfg or {}).get("paths") or {}).get("actor_spec")
+        if spec and os.path.isfile(spec):
+            return spec
     return None
 
 

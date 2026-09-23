@@ -17,9 +17,10 @@ motion_file=${MOTION:-${SCRIPT_DIR}/assets/LAAM/G6-axe_kick_poses.pkl}
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+upcoming+diff-pos-b-deploy.onnx}
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+upcoming.onnx}
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+GMT+diff-pos-b-deploy_hist25_futu1.onnx}
-# ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+future-pos-h+future-anchor_hist10.onnx}
+# ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+GMT+diff-pos-b_hist25_futu1.onnx}
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+future-pos-h+future-anchor_hist15_futu1.onnx}
-ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/ft/prop5+GMT+diff-pos-b-deploy_hist25_futu1_ft3000.onnx}
+# ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/ft/prop5+GMT+diff-pos-b-deploy_hist25_futu1_ft3000.onnx}
+ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/ft/prop5+future-pos-h+future-anchor_hist15_futu1_ft3000.onnx}
 
 video_path=${VIDEO:-}
 motion_args=("$@")
