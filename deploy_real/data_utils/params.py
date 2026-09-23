@@ -7,10 +7,9 @@ import numpy as np
 # whenever no motion was playing (before the motion server starts and again
 # after the motion ends). Root vel / roll / pitch / yaw are zeroed = stationary,
 # upright, in the robot's start-heading frame.
-DEFAULT_MIMIC_OBS_G1 = np.concatenate([
+DEFAULT_MIMIC_OBS_G1_STAND = np.concatenate([
                     np.array([0, 0]), # xy velocity (root-local)
                     np.array([0.7805]), # z position (A1-Stand frame-0 root height)
-                    # np.array([0.797]), # z position when robot's foot touches the ground
                     np.array([0, 0]), # roll/pitch
                     np.array([0]), # yaw (in robot's start-heading frame)
                     np.array([0, 0, 0]), # full angular velocity (root-local)
@@ -27,9 +26,9 @@ DEFAULT_MIMIC_OBS_G1 = np.concatenate([
 # policies chattered when the idle reference differed from the action=0
 # equilibrium pose (knee 0.4 vs 0.669, elbow 1.2 vs 0.6), so they want THIS as
 # the idle target. Swap it back in for pre-future (3928-dim) checkpoints.
-DEFAULT_MIMIC_OBS_G1_SQUAT = np.concatenate([
+DEFAULT_MIMIC_OBS_G1 = np.concatenate([
                     np.array([0, 0]), # xy velocity (root-local)
-                    np.array([0.793]), # z position (root height at the DEFAULT_DOF_POS stand)
+                    np.array([0.757]), # z position (root height at the DEFAULT_DOF_POS stand)
                     np.array([0, 0]), # roll/pitch
                     np.array([0]), # yaw (in robot's start-heading frame)
                     np.array([0, 0, 0]), # full angular velocity (root-local)

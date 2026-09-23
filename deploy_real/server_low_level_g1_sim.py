@@ -211,7 +211,8 @@ class RealTimePolicyController:
 
         # MuJoCo init qpos: [xyz(3), quat_wxyz(4), joint_pos(29)] at training init pose.
         self.mujoco_default_dof_pos = np.concatenate([
-            np.array([0, 0, 0.793]),
+            # np.array([0, 0, 0.7805]),
+            np.array([0, 0, 0.757]),    # squat
             np.array([1, 0, 0, 0]),
             self.default_dof_pos.copy(),
         ])
