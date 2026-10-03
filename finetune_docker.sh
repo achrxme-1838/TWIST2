@@ -14,7 +14,7 @@
 #       critic.teacher_ckpt=/root/isaaclab_ws/DEX_RL_LAB_PHUMA/scripts/logs/rsl_rl/g1_29dof_mapo/PHUMA_rt-v30_ap0.99_2026-08-21_06-59-55/model_30000.pt
 
 SCRIPT_DIR=$(dirname $(realpath $0))
-PY=${PY:-/workspace/isaaclab/_isaac_sim/python.sh}
+PY=${PY:-/root/isaaclab_ws/.venvs/mjwarp/bin/python}
 
 motion=${1:?motion pkl required}
 name=${2:-prop5+GMT+diff-pos-b_hist25_futu1}
@@ -24,6 +24,7 @@ export PYTHONNOUSERSITE=1
 unset PYTHONPATH
 export DEX_RSL_RL_ROOT=${DEX_RSL_RL_ROOT:-/root/isaaclab_ws/DEX_RL_LAB_PHUMA}
 export MUJOCO_GL=${MUJOCO_GL:-egl}
+export WARP_CACHE_PATH=${WARP_CACHE_PATH:-/root/isaaclab_ws/.cache/warp}
 
 cd ${SCRIPT_DIR}/finetune/scripts
 "$PY" train.py --motion "${motion}" --name "${name}" "$@"

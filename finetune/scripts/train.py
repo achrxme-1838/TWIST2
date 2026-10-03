@@ -124,7 +124,10 @@ def main():
     cfg = make_cfg(args)
     _paths.setup(cfg.paths.rsl_rl_root)
 
-    from finetune.env.mujoco_env import G1MimicVecEnv
+    if cfg.env.backend == "gpu":
+        from finetune.env.batched_mujoco_env import BatchedG1MimicVecEnv as MimicVecEnv
+    else:
+        from finetune.env.mujoco_env import G1MimicVecEnv as MimicVecEnv
     from finetune.mdp.policy import LoRAActorCritic, load_student_state, load_teacher_critic_state
     from rsl_rl.algorithms import PPO
 
@@ -139,7 +142,7 @@ def main():
         json.dump(cfg.to_dict(), f, indent=2)
     print(f"[train] run dir: {run_dir}")
 
-    env = G1MimicVecEnv(cfg, device=device)
+    env = MimicVecEnv(cfg, device=device)
     student_state = load_student_state(cfg.paths.student_pt)
     critic_state = load_teacher_critic_state(cfg.critic.teacher_ckpt) if cfg.critic.source == "teacher" else None
     policy = LoRAActorCritic(student_state, env.num_critic_obs, env.num_actions, cfg.lora, cfg.critic,

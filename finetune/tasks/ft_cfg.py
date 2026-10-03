@@ -74,6 +74,7 @@ class EnvCfg:
     kd_scale: float = 1.0
     reset_root_z_offset: float = 0.03
     realtime: bool = False
+    backend: str = "cpu"                # cpu (env/mujoco_env.py) / gpu (mujoco_warp, env/batched_mujoco_env.py)
     contact_force_threshold: float = 1.0
     contact_body_exclude: List[str] = field(default_factory=lambda: [".*ankle.*", ".*wrist.*"])
     soft_joint_limit_factor: float = 0.9
@@ -170,13 +171,34 @@ class FinetuneCfg:
     ppo: PPOCfg = field(default_factory=PPOCfg)
     train: TrainCfg = field(default_factory=TrainCfg)
 
+    def _expand_paths(self):
+        """Expand ``~`` in every path field. bash does not do it after ``=``, so an override like
+        ``--set critic.teacher_ckpt=~/x.pt`` arrives with a literal tilde."""
+        for name in ("student_pt", "actor_spec", "critic_spec", "motion_file", "xml", "log_root",
+                     "export_dir", "export_pt_dir", "rsl_rl_root"):
+            v = getattr(self.paths, name)
+            if isinstance(v, str) and v:
+                setattr(self.paths, name, os.path.expanduser(v))
+        if self.critic.teacher_ckpt:
+            self.critic.teacher_ckpt = os.path.expanduser(self.critic.teacher_ckpt)
+        if self.train.resume:
+            self.train.resume = os.path.expanduser(self.train.resume)
+
     def resolve(self) -> "FinetuneCfg":
+        self._expand_paths()
         if self.critic.source not in ("scratch", "teacher"):
             raise ValueError(f"critic.source must be scratch or teacher, got {self.critic.source!r}")
         if self.critic.source == "teacher" and not self.critic.teacher_ckpt:
             raise ValueError("critic.source=teacher needs critic.teacher_ckpt (DEX_RL_LAB model_N.pt)")
         if self.critic.adapt not in ("lora", "fft", "frozen"):
             raise ValueError(f"critic.adapt must be lora, fft or frozen, got {self.critic.adapt!r}")
+        if self.env.backend not in ("cpu", "gpu"):
+            raise ValueError(f"env.backend must be cpu or gpu, got {self.env.backend!r}")
+        if self.env.backend == "gpu" and not str(self.train.device).startswith("cuda"):
+            raise ValueError(
+                f"env.backend=gpu needs a CUDA train.device, got {self.train.device!r}. "
+                "Add train.device=cuda:0 (select the physical GPU with CUDA_VISIBLE_DEVICES)."
+            )
         if self.ppo.schedule not in ("adaptive", "fixed"):
             raise ValueError(f"ppo.schedule must be adaptive or fixed, got {self.ppo.schedule!r}")
         self.paths.resolve(self.critic.source)
