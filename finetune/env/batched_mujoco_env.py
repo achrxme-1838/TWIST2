@@ -70,6 +70,9 @@ class BatchedG1MimicVecEnv(VecEnv):
 
         self.rng = np.random.default_rng(ec.seed)
         self.force_motion_id: Optional[int] = None
+        # [num_envs] explicit per-env motion ids (evaluation); -1 leaves that env to sampling.
+        # Takes precedence over force_motion_id.
+        self.force_motion_ids: Optional[torch.Tensor] = None
         self.auto_reset = True
 
         z = lambda *s: torch.zeros(*s, device=self.device)
@@ -172,7 +175,12 @@ class BatchedG1MimicVecEnv(VecEnv):
     def _reset_envs(self, ids: torch.Tensor):
         mc, ec = self.cfg.motion, self.cfg.env
         n = ids.numel()
-        if self.force_motion_id is not None:
+        if self.force_motion_ids is not None:
+            mid = self.force_motion_ids[ids].clone()
+            free = mid < 0
+            if bool(free.any()):
+                mid[free] = self.motions.sample_motion(self.rng, int(free.sum()))
+        elif self.force_motion_id is not None:
             mid = torch.full((n,), int(self.force_motion_id), dtype=torch.long, device=self.device)
         else:
             mid = self.motions.sample_motion(self.rng, n)
@@ -201,6 +209,20 @@ class BatchedG1MimicVecEnv(VecEnv):
         t_origin = t0 + (mc.mimic_step_offset * self.control_dt if mc.anchor_origin_at_mimic_frame else 0.0)
         ref_origin_xy = self.motions.frame(mid, t_origin).root_pos[:, :2]
         self.anchor_delta_xy[ids] = self.core.qpos[ids][:, :2] - ref_origin_xy
+
+    def reset_envs_to(self, ids: torch.Tensor, mids: torch.Tensor):
+        """Evaluation helper (auto_reset=False): put ``ids`` on motions ``mids`` and refresh the
+        observation buffer. ``step`` already wrote one obs frame this tick, so the history ring
+        buffer is rewound first and the refreshed frame overwrites it -- envs that were not reset
+        recompute the same values, and the reset ones broadcast their new first frame."""
+        if self.force_motion_ids is None:
+            self.force_motion_ids = torch.full((self.num_envs,), -1, dtype=torch.long,
+                                               device=self.device)
+        self.force_motion_ids[ids] = mids
+        self._reset_envs(ids)
+        self.actor_builder.rewind()
+        self.critic_builder.rewind()
+        self._write_obs()
 
     def _context(self, robot=None, ref_frame=None, ref_body=None) -> BatchedObsContext:
         mc = self.cfg.motion

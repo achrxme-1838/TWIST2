@@ -113,6 +113,12 @@ class _BatchedTermSlot:
         else:
             self.fill[env_ids] = True
 
+    def rewind(self):
+        """Step the write pointer back one slot, so the next push overwrites the frame the last
+        push wrote instead of appending a new one."""
+        if self.history > 1:
+            self.ptr = (self.ptr - 1) % self.history
+
 
 class BatchedObsBuilder:
     def __init__(self, spec: PolicySpec, static: StaticContext, num_envs: int, device: torch.device):
@@ -151,6 +157,11 @@ class BatchedObsBuilder:
         """Forget history for these envs, so the next push refills their buffers."""
         for slot in self.slots:
             slot.reset(env_ids)
+
+    def rewind(self):
+        """Undo the last push's pointer advance (see _BatchedTermSlot.rewind)."""
+        for slot in self.slots:
+            slot.rewind()
 
     # ----- introspection -----
     def slices(self) -> Dict[str, slice]:

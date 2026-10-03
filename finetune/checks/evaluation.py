@@ -15,6 +15,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from finetune.checks._common import add_cfg_args, cfg_from_args  # noqa: E402
+from finetune.tasks.ft_cfg import PathsCfg  # noqa: E402
 
 LINK_METRICS = ("mpjpe_g", "mpjpe_l", "mpjpe_pa", "vel_dist", "accel_dist")
 JOINT_METRICS = ("upper_body_joints_dist", "lower_body_joints_dist")
@@ -209,6 +210,13 @@ def main():
     cfg.env.num_envs = 1
     cfg.termination.max_ref_motion_dist = float("inf")
     cfg.env.episode_length_s = 1e4
+
+    if cfg.paths.xml == PathsCfg.xml:
+        deploy_xml = cfg.paths.xml.replace("_29dof.xml", "_29dof_deploy.xml")
+        if os.path.isfile(deploy_xml):
+            cfg.paths.xml = deploy_xml
+    print(f"[eval] xml: {cfg.paths.xml}")
+
     from finetune.env.mujoco_env import G1MimicVecEnv
 
     actor, kind = load_actor(cfg.paths.student_pt)

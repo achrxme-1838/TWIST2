@@ -76,6 +76,7 @@ unitree_sdk2/
 twist2_demonstration/
 
 assets/ckpts/*
+assets/pt_finetuned/*
 assets/example_motions/*
 assets/MAPO_demo/*
 assets/g1/*
