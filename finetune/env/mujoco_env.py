@@ -90,6 +90,7 @@ class G1MimicVecEnv(VecEnv):
         if verbose:
             print(self.slots[0].actor_builder.describe())
             print("critic " + self.slots[0].critic_builder.describe())
+            print(self.rewards.describe())
             print(f"[env] num_envs={self.num_envs} control_dt={self.control_dt} decimation={core0.decimation} "
                   f"max_episode_length={self.max_episode_length}")
         self.reset()

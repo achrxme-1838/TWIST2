@@ -12,7 +12,6 @@ if "--headless" in sys.argv:
 
 import cv2
 import numpy as np
-import redis
 import mujoco
 import mujoco.viewer as mjv
 import torch
@@ -21,6 +20,7 @@ from tqdm import tqdm
 
 from data_utils.rot_utils import quatToEuler
 from data_utils.params import DEFAULT_MIMIC_OBS
+from motion_player import LocalMotionPlayer
 
 from cfg import g1_29dof_cfg as cfg
 from observations import _drive_ref_data, parse_future_raw
@@ -117,17 +117,28 @@ class RealTimePolicyController:
                  video_path="twist2_simulation.mp4",
                  video_size=(640, 480),
                  video_ref=False,
+                 record_from_motion_start=False,
                  sim_duration=100000.0,
+                 motion_npz=None,
+                 motion_start_delay=1.0,
+                 motion_blend_in_time=None,
+                 exit_after_motion=-1.0,
                  ):
         self.measure_fps = measure_fps
         self.limit_fps = limit_fps
         self.robot = robot
+        # Reference motion source: a precomputed motion played in-process (--motion_npz)
+        # or the motion server over Redis (legacy). In local mode Redis is not used at all.
+        self.motion_npz = motion_npz
         self.redis_client = None
-        try:
-            self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
-            self.redis_pipeline = self.redis_client.pipeline()
-        except Exception as e:
-            print(f"Error connecting to Redis: {e}")
+        self.redis_pipeline = None
+        if motion_npz is None:
+            try:
+                import redis
+                self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
+                self.redis_pipeline = self.redis_client.pipeline()
+            except Exception as e:
+                print(f"Error connecting to Redis: {e}")
 
         self.device = device
         self.policy = load_onnx_policy(policy_path, device)
@@ -146,6 +157,12 @@ class RealTimePolicyController:
         self.renderer = None      # offscreen renderer (headless + record_video)
         self.render_cam = None
         self.video_ref = bool(video_ref and headless and record_video)
+        # Drop the IDLE pre-roll: the controller opens the writer at startup, so the number of
+        # frames before the motion server finishes booting varies run to run (Isaac python boot +
+        # MotionLib load). Gating on the phase key makes every recording start on the same frame,
+        # which is what makes two checkpoints' videos directly comparable.
+        self.record_from_motion_start = bool(record_from_motion_start)
+        self._recording_started = not self.record_from_motion_start
         self.key_listener = None  # stdin keys stand in for the viewer key callback
         if not headless:
             self.viewer = mjv.launch_passive(
@@ -264,6 +281,21 @@ class RealTimePolicyController:
                 f"{self.total_obs_size} -- wrong --obs_cfg for this checkpoint?"
             )
 
+        # ----- in-process reference motion (replaces the Redis motion server) -----
+        self.motion_player = None
+        if motion_npz is not None:
+            self.motion_player = LocalMotionPlayer(
+                motion_npz, DEFAULT_MIMIC_OBS[self.robot],
+                control_dt=self.sim_decimation * self.sim_dt,
+                future_motion_steps=self.spec.future_motion_steps if self.spec.needs_future else None,
+                blend_in_time=motion_blend_in_time,
+            )
+            print(f"[motion] local playback of {motion_npz} ({self.motion_player.num_steps} steps), "
+                  f"start after {motion_start_delay:.2f}s sim time")
+        self.motion_start_step = int(round(motion_start_delay / self.sim_dt))
+        self.exit_after_motion = float(exit_after_motion)
+        self._post_motion_steps = 0
+
         # ----- odom-based world-root tracking for diff_body_* terms -----
         # When enabled, the reference motion root is anchored (per motion) to the
         # robot's current world root so motion frame 0 coincides with the robot.
@@ -332,32 +364,39 @@ class RealTimePolicyController:
         sim_torque = self.data.ctrl
         return dof_pos, dof_vel, quat, ang_vel, sim_torque
 
-    def _compute_ref_root_xy_w(self, robot_root_xy):
-        """Resolve the reference motion root xy in the (odom) world frame.
-
-        Reads the motion server's published root + a per-motion epoch from Redis.
-        On a new motion (epoch change) the world origin is re-anchored to the
-        robot's current world root, so the returned ref xy makes motion frame 0
-        coincide with the robot root and then translates with the motion.
-        Returns None when odom mode is off (callers then skip the offset).
-        """
-        if not self.update_robot_w_odom or self.redis_client is None:
-            return None
+    def _read_ref_root_redis(self):
+        """Motion server's published reference root xyz + per-motion epoch from Redis.
+        Returns (ref_root or None, epoch or None)."""
+        if self.redis_client is None:
+            return None, None
         try:
             raw_epoch = self.redis_client.get(f"motion_epoch_{self.robot}")
             raw_ref = self.redis_client.get(f"ref_root_world_{self.robot}")
         except Exception:
-            raw_epoch, raw_ref = None, None
+            return None, None
 
-        ref_xy = None
+        ref_root = None
         if raw_ref is not None:
             try:
                 ref_root = np.asarray(json.loads(raw_ref), dtype=np.float64)
-                ref_xy = ref_root[:2]
             except Exception:
-                ref_xy = None
-
+                ref_root = None
         epoch = raw_epoch.decode() if isinstance(raw_epoch, bytes) else raw_epoch
+        return ref_root, epoch
+
+    def _compute_ref_root_xy_w(self, robot_root_xy, ref_root, epoch):
+        """Resolve the reference motion root xy in the (odom) world frame.
+
+        ``ref_root`` / ``epoch`` are the reference root xyz + per-motion epoch from the
+        motion source (local player or Redis). On a new motion (epoch change) the world
+        origin is re-anchored to the robot's current world root, so the returned ref xy
+        makes motion frame 0 coincide with the robot root and then translates with the
+        motion. Returns None when odom mode is off (callers then skip the offset).
+        """
+        if not self.update_robot_w_odom:
+            return None
+        ref_xy = None if ref_root is None else np.asarray(ref_root, dtype=np.float64)[:2]
+
         if epoch != self._motion_epoch:
             # New motion: reset and re-latch the origin on the first frame whose
             # reference root is actually available (= motion frame 0).
@@ -475,20 +514,21 @@ class RealTimePolicyController:
         steps = int(self.sim_duration / self.sim_dt)
         pbar = tqdm(range(steps), desc="Simulating TWIST2...")
 
-        # Seed Redis so the teleop bridge has something to read on its first tick.
-        initial_state_body = np.zeros(3 + 2 + self.num_actions, dtype=np.float32)
-        self.redis_pipeline.set("state_body_unitree_g1_with_hands", json.dumps(initial_state_body.tolist()))
-        self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
-        self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
-        self.redis_pipeline.set("state_heading_unitree_g1_with_hands", json.dumps(0.0))
+        if self.redis_pipeline is not None:
+            # Seed Redis so the teleop bridge has something to read on its first tick.
+            initial_state_body = np.zeros(3 + 2 + self.num_actions, dtype=np.float32)
+            self.redis_pipeline.set("state_body_unitree_g1_with_hands", json.dumps(initial_state_body.tolist()))
+            self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
+            self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
+            self.redis_pipeline.set("state_heading_unitree_g1_with_hands", json.dumps(0.0))
 
-        # Idle-default seed for action_* keys (avoids chasing stale targets).
-        default_mimic_obs = DEFAULT_MIMIC_OBS["unitree_g1_with_hands"]
-        self.redis_pipeline.set("action_body_unitree_g1_with_hands", json.dumps(default_mimic_obs.tolist()))
-        self.redis_pipeline.set("action_hand_left_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
-        self.redis_pipeline.set("action_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
-        self.redis_pipeline.set("action_neck_unitree_g1_with_hands", json.dumps(np.zeros(2).tolist()))
-        self.redis_pipeline.execute()
+            # Idle-default seed for action_* keys (avoids chasing stale targets).
+            default_mimic_obs = DEFAULT_MIMIC_OBS["unitree_g1_with_hands"]
+            self.redis_pipeline.set("action_body_unitree_g1_with_hands", json.dumps(default_mimic_obs.tolist()))
+            self.redis_pipeline.set("action_hand_left_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
+            self.redis_pipeline.set("action_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
+            self.redis_pipeline.set("action_neck_unitree_g1_with_hands", json.dumps(np.zeros(2).tolist()))
+            self.redis_pipeline.execute()
 
         # Drop any stale future-motion frames left in Redis by a previous motion
         # run so we start on the stationary fallback (default pose) instead of
@@ -516,43 +556,60 @@ class RealTimePolicyController:
                 if i % self.sim_decimation == 0:
                     rpy = quatToEuler(quat)
 
-                    # state_body (teleop bridge input) stays in MuJoCo/SDK order.
-                    state_body = np.concatenate([ang_vel, rpy[:2], dof_pos])  # 3+2+29 = 34
-                    self.redis_pipeline.set("state_body_unitree_g1_with_hands", json.dumps(state_body.tolist()))
-                    self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
-                    self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
-                    self.redis_pipeline.set("state_neck_unitree_g1_with_hands", json.dumps(np.zeros(2).tolist()))
-                    # Robot heading; motion_server reads once at playback start to anchor frame 0.
-                    robot_heading = yaw_from_quat(self.data.qpos[3:7])
-                    self.redis_pipeline.set("state_heading_unitree_g1_with_hands", json.dumps(robot_heading))
-                    self.redis_pipeline.set("t_state", int(time.time() * 1000))
-                    self.redis_pipeline.execute()
+                    if self.motion_player is not None:
+                        # In-process reference: no IPC, advanced by this policy step.
+                        if not self.motion_player.started and i >= self.motion_start_step:
+                            self.motion_player.start(yaw_from_quat(self.data.qpos[3:7]))
+                        sample = self.motion_player.step()
+                        if self.motion_player.done and self.exit_after_motion >= 0:
+                            self._post_motion_steps += 1
+                            if self._post_motion_steps * self.sim_decimation * self.sim_dt > self.exit_after_motion:
+                                print(f"[motion] playback finished; exiting at t={i * self.sim_dt:.2f}s")
+                                break
+                        action_mimic = sample.action_mimic
+                        motion_phase = sample.phase
+                        future_raw = sample.future_raw if self.spec.needs_future else None
+                        ref_root, ref_epoch = sample.ref_root, sample.epoch
+                    else:
+                        # state_body (teleop bridge input) stays in MuJoCo/SDK order.
+                        state_body = np.concatenate([ang_vel, rpy[:2], dof_pos])  # 3+2+29 = 34
+                        self.redis_pipeline.set("state_body_unitree_g1_with_hands", json.dumps(state_body.tolist()))
+                        self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
+                        self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
+                        self.redis_pipeline.set("state_neck_unitree_g1_with_hands", json.dumps(np.zeros(2).tolist()))
+                        # Robot heading; motion_server reads once at playback start to anchor frame 0.
+                        robot_heading = yaw_from_quat(self.data.qpos[3:7])
+                        self.redis_pipeline.set("state_heading_unitree_g1_with_hands", json.dumps(robot_heading))
+                        self.redis_pipeline.set("t_state", int(time.time() * 1000))
+                        self.redis_pipeline.execute()
 
-                    keys = [
-                        "action_body_unitree_g1_with_hands",
-                        "action_hand_left_unitree_g1_with_hands",
-                        "action_hand_right_unitree_g1_with_hands",
-                        "action_neck_unitree_g1_with_hands",
-                    ]
-                    future_idx = len(keys)
-                    if self.spec.needs_future:
-                        keys += [f"{k}_{self.robot}" for k in cfg.FUTURE_MOTION_KEYS]
-                    phase_idx = len(keys)
-                    keys.append(f"{cfg.MOTION_PHASE_KEY}_{self.robot}")  # video overlay only
-                    for key in keys:
-                        self.redis_pipeline.get(key)
-                    redis_results = self.redis_pipeline.execute()
-                    action_mimic = np.asarray(json.loads(redis_results[0]), dtype=np.float32)
-                    raw_phase = redis_results[phase_idx]
-                    motion_phase = raw_phase.decode().upper() if raw_phase else "IDLE"
+                        keys = [
+                            "action_body_unitree_g1_with_hands",
+                            "action_hand_left_unitree_g1_with_hands",
+                            "action_hand_right_unitree_g1_with_hands",
+                            "action_neck_unitree_g1_with_hands",
+                        ]
+                        future_idx = len(keys)
+                        if self.spec.needs_future:
+                            keys += [f"{k}_{self.robot}" for k in cfg.FUTURE_MOTION_KEYS]
+                        phase_idx = len(keys)
+                        keys.append(f"{cfg.MOTION_PHASE_KEY}_{self.robot}")  # video overlay only
+                        for key in keys:
+                            self.redis_pipeline.get(key)
+                        redis_results = self.redis_pipeline.execute()
+                        action_mimic = np.asarray(json.loads(redis_results[0]), dtype=np.float32)
+                        raw_phase = redis_results[phase_idx]
+                        motion_phase = raw_phase.decode().upper() if raw_phase else "IDLE"
 
-                    future_raw = None
-                    if self.spec.needs_future:
-                        fr = redis_results[future_idx:future_idx + len(cfg.FUTURE_MOTION_KEYS)]
-                        future_raw = parse_future_raw(
-                            fr[0], fr[1], fr[2], self.spec.future_steps, self.num_actions,
-                            raw_lin_vel=fr[3], raw_ang_vel=fr[4],
-                        )
+                        future_raw = None
+                        if self.spec.needs_future:
+                            fr = redis_results[future_idx:future_idx + len(cfg.FUTURE_MOTION_KEYS)]
+                            future_raw = parse_future_raw(
+                                fr[0], fr[1], fr[2], self.spec.future_steps, self.num_actions,
+                                raw_lin_vel=fr[3], raw_ang_vel=fr[4],
+                            )
+                        ref_root, ref_epoch = (self._read_ref_root_redis() if self.update_robot_w_odom
+                                               else (None, None))
 
                     # Odom world-root tracking. In sim the robot world root is GT
                     # (data.qpos); publish it to the ROS odom topic so the same
@@ -562,7 +619,7 @@ class RealTimePolicyController:
                     if self.update_robot_w_odom:
                         if self.odom_pub is not None:
                             self.odom_pub.publish(self.data.qpos[:3], self.data.qpos[3:7])
-                        ref_root_xy_w = self._compute_ref_root_xy_w(self.data.qpos[:2])
+                        ref_root_xy_w = self._compute_ref_root_xy_w(self.data.qpos[:2], ref_root, ref_epoch)
 
                     obs_buf = self.compute_observation(
                         dof_pos, dof_vel, ang_vel, rpy, action_mimic,
@@ -615,13 +672,20 @@ class RealTimePolicyController:
                     pd_target_isaac = raw_action * self.action_scale + self.default_dof_pos_isaac
                     pd_target = pd_target_isaac[self.isaac_to_sdk]
 
+                    # sticky: once the motion server leaves IDLE, keep recording to the end
+                    if not self._recording_started and motion_phase != "IDLE":
+                        self._recording_started = True
+                        print(f"[video] recording from motion start (phase={motion_phase}, "
+                              f"t={i * self.sim_dt:.2f}s)")
+                    record_frame = mp4_writer is not None and self._recording_started
+
                     pelvis_pos = self.data.xpos[self.model.body("pelvis").id]
                     if self.viewer is not None:
                         self.viewer.cam.lookat = pelvis_pos
                         self.viewer.sync()
-                        if mp4_writer is not None:
+                        if record_frame:
                             mp4_writer.append_data(self._overlay(self.viewer.read_pixels(), i, motion_phase))
-                    elif self.renderer is not None:
+                    elif self.renderer is not None and record_frame:
                         self.render_cam.lookat[:] = pelvis_pos
                         self.renderer.update_scene(self.data, camera=self.render_cam)
                         frame = self._overlay(self.renderer.render(), i, motion_phase)
@@ -665,7 +729,12 @@ class RealTimePolicyController:
         finally:
             if mp4_writer is not None:
                 mp4_writer.close()
-                print(f"Video saved as {self.video_path}")
+                if self.record_from_motion_start and not self._recording_started:
+                    print("[video] WARNING: the motion server never left IDLE, so no frame was "
+                          f"recorded; {self.video_path} is empty. Drop "
+                          "--record_from_motion_start to capture the idle pre-roll too.")
+                else:
+                    print(f"Video saved as {self.video_path}")
 
             if self.record_proprio and self.proprio_recordings:
                 import pickle
@@ -701,6 +770,10 @@ def main():
                              'reference (mimic target) pose next to the robot.')
     parser.add_argument('--video_size', type=int, nargs=2, default=(640, 480), metavar=('W', 'H'),
                         help='Offscreen render size for --headless --record_video.')
+    parser.add_argument('--record_from_motion_start', action='store_true',
+                        help='With --record_video: skip the IDLE pre-roll and start the mp4 on the '
+                             'first non-IDLE motion-server phase, so recordings of different '
+                             'policies line up frame for frame.')
     parser.add_argument('--sim_duration', type=float, default=100000.0,
                         help='Stop after this many simulated seconds (default: effectively unbounded).')
     parser.add_argument('--record_proprio', action='store_true', help='Record proprioceptive data')
@@ -727,6 +800,17 @@ def main():
     parser.add_argument("--odom_topic", type=str, default="/twist2/sim_odom",
                         help="nav_msgs/Odometry topic the sim publishes GT root to "
                              "(used when --update_robot_w_odom is set).")
+    parser.add_argument("--motion_npz", type=str, default=None,
+                        help="Play this precomputed reference motion (export_motion_ref.py) "
+                             "in-process instead of reading the motion server over Redis.")
+    parser.add_argument("--motion_start_delay", type=float, default=1.0,
+                        help="With --motion_npz: sim seconds in the stand pose before the "
+                             "motion starts (blend-in begins).")
+    parser.add_argument("--motion_blend_in_time", type=float, default=None,
+                        help="With --motion_npz: override the exported blend-in time [s].")
+    parser.add_argument("--exit_after_motion", type=float, default=-1.0,
+                        help="With --motion_npz: stop this many seconds after the motion has "
+                             "returned to the default pose (<0: keep running).")
     args = parser.parse_args()
 
     if not os.path.exists(args.policy):
@@ -749,6 +833,7 @@ def main():
     print(f"  Limit FPS: {args.limit_fps}")
     print(f"  Kp scale: {args.kp_scale}")
     print(f"  Kd scale: {args.kd_scale}")
+    print(f"  Motion source: {args.motion_npz or 'redis (motion server)'}")
     controller = RealTimePolicyController(
         xml_file=args.xml,
         policy_path=args.policy,
@@ -768,7 +853,12 @@ def main():
         video_path=args.video_path,
         video_size=tuple(args.video_size),
         video_ref=args.video_ref,
+        record_from_motion_start=args.record_from_motion_start,
         sim_duration=args.sim_duration,
+        motion_npz=args.motion_npz,
+        motion_start_delay=args.motion_start_delay,
+        motion_blend_in_time=args.motion_blend_in_time,
+        exit_after_motion=args.exit_after_motion,
     )
     # SIGTERM (e.g. from a batch script / docker stop) -> same clean shutdown as Ctrl+C,
     # so the mp4 / proprio recordings still get flushed in run()'s finally block.

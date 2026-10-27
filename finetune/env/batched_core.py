@@ -159,6 +159,10 @@ class BatchedG1SimCore:
         )
 
         self.last_torque = torch.zeros(num_envs, J, device=dev)
+        # PD torque before the effort-limit clamp, i.e. IsaacLab's computed_torque. Only the
+        # evaluation's constraint-violation metrics read it: the clamped last_torque saturates at
+        # the very limits they score, so its violation would be identically zero.
+        self.last_torque_raw = torch.zeros(num_envs, J, device=dev)
         self._contact_max = torch.zeros(num_envs, self.model.nbody, device=dev)
 
         # contact-force scratch (device-side; no host sync in the substep loop)
@@ -199,6 +203,7 @@ class BatchedG1SimCore:
         self.qvel[env_ids, 6:6 + J] = dof_vel_sdk
         self.ctrl[env_ids] = 0.0
         self.last_torque[env_ids] = 0.0
+        self.last_torque_raw[env_ids] = 0.0
         self._contact_max[env_ids] = 0.0
         mjwarp.forward(self.mw, self.dw)
 
@@ -221,6 +226,7 @@ class BatchedG1SimCore:
             if k in self.contact_substeps:
                 self._accumulate_contact_forces()
         self.last_torque[:] = self.ctrl
+        self.last_torque_raw[:] = torque            # last substep, pre-clamp
         mjwarp.forward(self.mw, self.dw)   # refresh kinematics / body velocities
 
     def _accumulate_contact_forces(self):

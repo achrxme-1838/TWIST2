@@ -69,6 +69,16 @@ def main():
                    help="reference motion time a recorded state is scored against. pre (default) "
                         "matches IsaacLab humanoid_eval.py; post uses the current motion time.")
     p.add_argument("--max-motions", type=int, default=None, help="evaluate only the first N motions")
+    p.add_argument("--no-quality", dest="quality", action="store_false",
+                   help="skip the motion-quality metrics (smoothness / foot slip / constraint "
+                        "violations). They are reported on the success trials only, as in IsaacLab.")
+    p.add_argument("--jerk-keypoints", default=None,
+                   help="comma-separated body names reported as keypoint_jerk, e.g. "
+                        "'left_ankle_roll_link,right_ankle_roll_link'. Defaults to the IsaacLab "
+                        "config's G1_29DOF_EVAL_JERK_KEYPOINTS.")
+    p.add_argument("--quality-warmup-steps", type=int, default=0,
+                   help="steps skipped at the start of each trial when accumulating the quality "
+                        "metrics (IsaacLab --quality_warmup_steps).")
     p.add_argument("--workers", type=int, default=0, help=argparse.SUPPRESS)   # deprecated, ignored
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--out", default=None)
@@ -115,6 +125,14 @@ def main():
     print(f"[eval] {n_motions} motions x {args.episodes_per_motion} trials on {N} parallel envs "
           f"| fail: body dist > {args.fail_max_dist} m ({args.fail_mode}) | ref-at={args.ref_at}")
 
+    quality = None
+    if args.quality:
+        from finetune.checks.quality_metrics import BatchedQualityTracker
+        keypoints = ([k.strip() for k in args.jerk_keypoints.split(",") if k.strip()]
+                     if args.jerk_keypoints else None)
+        quality = BatchedQualityTracker(env, args.device, jerk_keypoints=keypoints,
+                                        warmup_steps=args.quality_warmup_steps)
+
     jobs = [(mid, k) for mid in range(n_motions) for k in range(args.episodes_per_motion)]
     total_jobs = len(jobs)
     next_job = 0
@@ -137,7 +155,7 @@ def main():
     reduce_dist = {"mean": lambda a: a.mean(axis=-1), "any": lambda a: a.max(axis=-1)}[args.fail_mode]
     if args.workers:
         print("[eval] --workers is ignored: the metric reduction costs ~2 ms/trial and runs inline.")
-    results = {}                       # job -> (variants, failed)
+    results = {}                       # job -> (variants, failed, quality values or None)
 
     obs, _ = env.get_observations()
     t_start = time.time()
@@ -179,13 +197,19 @@ def main():
             if rec.fail_frame[i] is None and failed_now[i]:
                 rec.fail_frame[i] = len(rec.buf[i]["body_pos"])
 
+        if quality is not None:
+            # ``active`` is still the pre-step mask here, so the trial that ended on this very
+            # step is counted and the idle envs are not -- IsaacLab's ~self._terminated.
+            quality.update(robot, env.last_action, active)
+
         finished = [int(i) for i in np.nonzero(act_np & done_np)[0]]
         if finished:
+            qvals = quality.pop(finished) if quality is not None else [None] * len(finished)
             refill_ids, refill_mids = [], []
-            for i in finished:
+            for i, qv in zip(finished, qvals):
                 job = rec.job[i]
                 pred, gt, ff, n, failed = rec.finish(i)
-                results[job] = (_trial_metrics((pred, gt, ff, n)), failed)
+                results[job] = (_trial_metrics((pred, gt, ff, n)), failed, qv)
                 rec.clear(i)
                 if next_job < total_jobs:
                     rec.job[i] = jobs[next_job]
@@ -210,10 +234,15 @@ def main():
     # ---- aggregate over every trial; no per-motion breakdown ----
     agg = {k: Aggregate() for k in ("all", "success", "keep", "continue")}
     num_trials, num_success = 0, 0
-    for var, failed in results.values():
+    for var, failed, qv in results.values():
         agg["all"].add(var["all"]); agg["keep"].add(var["keep"]); agg["continue"].add(var["continue"])
         if not failed:
             agg["success"].add(var["all"])
+            # Quality metrics have no ground truth and are only defined on a motion tracked to
+            # the end, so they join the Success variant only -- IsaacLab record_quality_metrics.
+            # One trial, one value: weight 1 makes the aggregate their plain mean.
+            if qv:
+                agg["success"].add({k: (v, 1) for k, v in qv.items()})
             num_success += 1
         num_trials += 1
 
@@ -225,6 +254,10 @@ def main():
         ("fail_criterion", {"mode": args.fail_mode, "max_dist": args.fail_max_dist}),
         ("start", {"mode": args.start, "settle_time": 0.0}),
         ("ref_at", args.ref_at),
+        ("quality_metrics", {"enabled": bool(args.quality),
+                             "warmup_steps": args.quality_warmup_steps,
+                             "jerk_keypoints": quality.keypoint_names} if args.quality
+                            else {"enabled": False}),
         ("num_envs", N),
         ("num_unique_motions", n_motions),
         ("trials_per_motion", args.episodes_per_motion),

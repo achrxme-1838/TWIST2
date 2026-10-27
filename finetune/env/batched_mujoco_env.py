@@ -90,6 +90,7 @@ class BatchedG1MimicVecEnv(VecEnv):
         if verbose:
             print(self.actor_builder.describe())
             print("critic " + self.critic_builder.describe())
+            print(self.rewards.describe())
             print(f"[env] num_envs={N} control_dt={self.control_dt} decimation={self.core.decimation} "
                   f"max_episode_length={self.max_episode_length} device={device}")
         self.reset()

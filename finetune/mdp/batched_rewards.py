@@ -5,7 +5,9 @@ from typing import Dict, Tuple
 import numpy as np
 import torch
 
+from cfg import g1_29dof_cfg as rcfg   # deploy_real
 from finetune.helper.torch_math import quat_error_magnitude
+from finetune.mdp.rewards import RewardComputer, check_terms
 from finetune.motion_data.batched_motion_ref import BatchedRefBodyState
 from finetune.tasks.ft_cfg import RewardCfg, TerminationCfg
 
@@ -22,20 +24,17 @@ class BatchedRewardComputer:
         self.soft_hi = f(soft_joint_limits_sdk[:, 1])
         self.contact_body_ids = torch.as_tensor(np.asarray(contact_body_ids, dtype=np.int64), device=device)
         self.contact_threshold = contact_force_threshold
-        self.weights = {
-            "root_orientation": cfg.root_orientation_w,
-            "mimic_extended_body_pos_exp": cfg.body_pos_w,
-            "mimic_extended_body_ori_exp": cfg.body_ori_w,
-            "mimic_body_lin_vel_exp": cfg.body_lin_vel_w,
-            "mimic_body_ang_vel_exp": cfg.body_ang_vel_w,
-            "action_rate": cfg.action_rate_w,
-            "joint_pos_limits": cfg.joint_pos_limits_w,
-            "undesired_contacts": cfg.undesired_contacts_w,
-        }
+        self.feet_body_ids = torch.as_tensor(
+            np.array([list(rcfg.TRACKED_BODY_NAMES).index(n) for n in cfg.feet_body_names],
+                     dtype=np.int64), device=device)
+        self.weights = check_terms(cfg.terms)
 
     @property
     def term_names(self):
         return list(self.weights)
+
+    def describe(self) -> str:
+        return RewardComputer.describe(self)
 
     def __call__(self, robot, ref: BatchedRefBodyState, ref_root_quat: torch.Tensor,
                  action: torch.Tensor, prev_action: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -44,26 +43,42 @@ class BatchedRewardComputer:
         n = ref.lin_vel.shape[1]      # tracked bodies (extended excluded from the velocity terms)
         raw: Dict[str, torch.Tensor] = {}
 
-        rot_err = quat_error_magnitude(robot.root_quat, ref_root_quat)
-        raw["root_orientation"] = torch.exp(-(rot_err ** 2) / c.root_orientation_sigma)
+        w = self.weights
 
-        pos_err = (robot.body_pos - ref.pos).pow(2).flatten(1).mean(dim=1)
-        raw["mimic_extended_body_pos_exp"] = torch.exp(-pos_err / c.body_pos_sigma)
+        if "root_orientation" in w:
+            rot_err = quat_error_magnitude(robot.root_quat, ref_root_quat)
+            raw["root_orientation"] = torch.exp(-(rot_err ** 2) / c.root_orientation_sigma)
 
-        ori_err = quat_error_magnitude(robot.body_quat, ref.quat).mean(dim=1)
-        raw["mimic_extended_body_ori_exp"] = torch.exp(-(ori_err ** 2) / c.body_ori_sigma)
+        if "mimic_extended_body_pos_exp" in w:
+            pos_err = (robot.body_pos - ref.pos).pow(2).flatten(1).mean(dim=1)
+            raw["mimic_extended_body_pos_exp"] = torch.exp(-pos_err / c.body_pos_sigma)
 
-        lin_err = (robot.body_lin_vel[:, :n] - ref.lin_vel).pow(2).flatten(1).mean(dim=1)
-        raw["mimic_body_lin_vel_exp"] = torch.exp(-lin_err / c.body_lin_vel_sigma)
+        if "mimic_extended_body_ori_exp" in w:
+            ori_err = quat_error_magnitude(robot.body_quat, ref.quat).mean(dim=1)
+            raw["mimic_extended_body_ori_exp"] = torch.exp(-(ori_err ** 2) / c.body_ori_sigma)
 
-        ang_err = (robot.body_ang_vel[:, :n] - ref.ang_vel).pow(2).flatten(1).mean(dim=1)
-        raw["mimic_body_ang_vel_exp"] = torch.exp(-ang_err / c.body_ang_vel_sigma)
+        if "mimic_body_lin_vel_exp" in w:
+            lin_err = (robot.body_lin_vel[:, :n] - ref.lin_vel).pow(2).flatten(1).mean(dim=1)
+            raw["mimic_body_lin_vel_exp"] = torch.exp(-lin_err / c.body_lin_vel_sigma)
 
-        raw["action_rate"] = (action - prev_action).pow(2).sum(dim=1)
-        out = (robot.dof_pos_sdk < self.soft_lo) | (robot.dof_pos_sdk > self.soft_hi)
-        raw["joint_pos_limits"] = out.float().sum(dim=1)
-        contact = robot.contact_force[:, self.contact_body_ids] > self.contact_threshold
-        raw["undesired_contacts"] = contact.float().sum(dim=1)
+        if "mimic_body_ang_vel_exp" in w:
+            ang_err = (robot.body_ang_vel[:, :n] - ref.ang_vel).pow(2).flatten(1).mean(dim=1)
+            raw["mimic_body_ang_vel_exp"] = torch.exp(-ang_err / c.body_ang_vel_sigma)
+
+        if "feet_pos_exp" in w:
+            # DEX mimic_specific_body_pos_exp: mean over the selected bodies *and* xyz
+            ids = self.feet_body_ids
+            feet_err = (robot.body_pos[:, ids] - ref.pos[:, ids]).pow(2).flatten(1).mean(dim=1)
+            raw["feet_pos_exp"] = torch.exp(-feet_err / c.feet_pos_sigma)
+
+        if "action_rate" in w:
+            raw["action_rate"] = (action - prev_action).pow(2).sum(dim=1)
+        if "joint_pos_limits" in w:
+            out = (robot.dof_pos_sdk < self.soft_lo) | (robot.dof_pos_sdk > self.soft_hi)
+            raw["joint_pos_limits"] = out.float().sum(dim=1)
+        if "undesired_contacts" in w:
+            contact = robot.contact_force[:, self.contact_body_ids] > self.contact_threshold
+            raw["undesired_contacts"] = contact.float().sum(dim=1)
 
         total = sum(self.weights[k] * v for k, v in raw.items()) * self.dt
         return total, raw

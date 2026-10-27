@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from finetune._paths import TWIST2_ROOT
 
@@ -17,7 +17,7 @@ class PathsCfg:
     motion_file: str = ""      # integrated joblib pkl (many motions) -- required
     xml: str = os.path.join(TWIST2_ROOT, "assets", "g1", "g1_sim2sim_29dof.xml")
     log_root: str = os.path.join(TWIST2_ROOT, "logs", "finetune")
-    export_dir: str = os.path.join(TWIST2_ROOT, "assets", "ckpts")              # ONNX (+ spec) for the deploy servers
+    export_dir: str = os.path.join(TWIST2_ROOT, "assets", "ckpts", "ft")              # ONNX (+ spec) for the deploy servers
     export_pt_dir: str = os.path.join(TWIST2_ROOT, "assets", "pt_finetuned")    # rsl_rl .pt for IsaacLab play.py
     rsl_rl_root: Optional[str] = None   # DEX_RL_LAB_PHUMA dir; None -> auto (see _paths.py)
 
@@ -83,19 +83,30 @@ class EnvCfg:
 
 @dataclass
 class RewardCfg:
-    root_orientation_w: float = 0.5
+    terms: Dict[str, float] = field(default_factory=lambda: {
+        # -- task
+        "root_orientation":             0.5,
+        "mimic_extended_body_pos_exp": 20.0,
+        "mimic_extended_body_ori_exp":  1.0,
+        "mimic_body_lin_vel_exp":       1.0,
+        "mimic_body_ang_vel_exp":       1.0,
+        # "feet_pos_exp":                40.0,
+        # -- regularisation
+        "action_rate":                 -0.3,
+        "joint_pos_limits":           -10.0,
+        "undesired_contacts":          -0.1,
+    })
+
+    # exp-kernel widths; each is read only by the term named in the comment
     root_orientation_sigma: float = 0.4 ** 2
-    body_pos_w: float = 20.0
-    body_pos_sigma: float = 0.05 ** 2
-    body_ori_w: float = 1.0
+    body_pos_sigma: float = 0.3 ** 2
     body_ori_sigma: float = 0.4 ** 2
-    body_lin_vel_w: float = 1.0
     body_lin_vel_sigma: float = 1.0 ** 2
-    body_ang_vel_w: float = 1.0
     body_ang_vel_sigma: float = 3.14 ** 2
-    action_rate_w: float = -0.3
-    joint_pos_limits_w: float = -10.0
-    undesired_contacts_w: float = -0.1
+    feet_pos_sigma: float = 0.045 ** 2
+    feet_body_names: List[str] = field(
+        default_factory=lambda: ["left_ankle_roll_link", "right_ankle_roll_link"])
+
     scale_by_dt: bool = True
 
 
@@ -154,7 +165,7 @@ class TrainCfg:
     log_interval: int = 1
     device: str = "cpu"
     init_noise_std: Optional[float] = 0.2
-    std_trainable: bool = True
+    std_trainable: bool = False
     std_lr: Optional[float] = 1e-3
     resume: str = ""
 
@@ -233,8 +244,14 @@ def apply_overrides(cfg: FinetuneCfg, items: List[str]) -> FinetuneCfg:
         parts = key.split(".")
         node = cfg
         for p in parts[:-1]:
-            node = getattr(node, p)
+            node = node[p] if isinstance(node, dict) else getattr(node, p)
         name = parts[-1]
+        if isinstance(node, dict):
+            if name not in node:
+                raise KeyError(f"unknown key {name!r} in {'.'.join(parts[:-1])} "
+                               f"(have: {', '.join(node)})")
+            node[name] = _cast(value, node[name])
+            continue
         if not hasattr(node, name):
             raise AttributeError(f"unknown cfg field: {key}")
         current = getattr(node, name)
