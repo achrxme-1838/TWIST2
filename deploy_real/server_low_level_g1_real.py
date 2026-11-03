@@ -19,7 +19,8 @@ pose -- which the sim reads from MuJoCo -- is estimated (--root_source):
 The estimated root + measured joints drive an FK-only MjData (``self.data``), which is
 what the obs terms read where the sim reads its simulated MjData.
 
-Remote: START -> move to default pose, A -> policy loop, B -> start (or restart) the
+Remote: START -> move to default pose (+ hold odom_calib_delay s, odom calibration),
+A -> policy loop + --stand_npz motion, B -> start (or restart) the
 motion, Select -> damping + exit. Terminal keys 2..9 / X set the PD gain scale.
 """
 import argparse
@@ -155,6 +156,8 @@ class RealTimePolicyController:
                  print_odom_hz=0.0,
                  robot="unitree_g1_with_hands",
                  motion_npz=None,
+                 stand_npz=None,
+                 odom_calib_delay=5.0,
                  motion_start_delay=-1.0,
                  motion_blend_in_time=None,
                  exit_after_motion=-1.0,
@@ -258,17 +261,30 @@ class RealTimePolicyController:
             )
 
         # ----- in-process reference motion (replaces the Redis motion server) -----
+        # motion_player: the B motion. stand_player (optional): played right after A.
+        # Only one of them is stepped at a time (self._active_player).
         self.motion_player = None
+        self.stand_player = None
         if motion_npz is not None:
-            self.motion_player = LocalMotionPlayer(
-                motion_npz, DEFAULT_MIMIC_OBS[self.robot],
-                control_dt=self.control_dt,
-                future_motion_steps=self.spec.future_motion_steps if self.spec.needs_future else None,
-                blend_in_time=motion_blend_in_time,
-            )
+            def _make_player(path):
+                return LocalMotionPlayer(
+                    path, DEFAULT_MIMIC_OBS[self.robot],
+                    control_dt=self.control_dt,
+                    future_motion_steps=self.spec.future_motion_steps if self.spec.needs_future else None,
+                    blend_in_time=motion_blend_in_time,
+                )
+            self.motion_player = _make_player(motion_npz)
             start = (f"auto start {motion_start_delay:.1f}s after A" if motion_start_delay >= 0
                      else "press B to start")
             print(f"[motion] local playback of {motion_npz} ({self.motion_player.num_steps} steps); {start}")
+            if stand_npz is not None:
+                self.stand_player = _make_player(stand_npz)
+                print(f"[motion] stand motion {stand_npz} ({self.stand_player.num_steps} steps); "
+                      f"plays right after A")
+        elif stand_npz is not None:
+            print("[motion] --stand_npz ignored: needs --motion_npz (local playback)")
+        self._active_player = self.stand_player or self.motion_player
+        self.odom_calib_delay = float(odom_calib_delay)
         self.motion_start_delay = float(motion_start_delay)
         self.exit_after_motion = float(exit_after_motion)
         self._post_motion_steps = 0
@@ -329,8 +345,55 @@ class RealTimePolicyController:
     def reset_robot(self):
         print("Press START on remote to move to default position ...")
         self.env.move_to_default_pos()
-        print("Now in default position, press A to start the policy ...")
+        if self.root_source == "odom":
+            self._calibrate_odom_at_default()
+        a_msg = ("policy + stand motion" if self.stand_player is not None else "the policy")
+        print(f"[green]Now in default position, press A to start {a_msg} ...[/green]")
         self.env.default_pos_state()
+
+    def _hold_default(self):
+        self.env.send_robot_action(self.env.config.default_angles.copy())
+        if self.realtime:
+            time.sleep(self.control_dt)
+
+    def _calibrate_odom_at_default(self):
+        """Hold the default pose for odom_calib_delay seconds, then latch the
+        odom -> robot-world calibration (instead of at the first policy step).
+        Keeps holding (and retrying) while the odometry is missing / stale;
+        Select aborts."""
+        print(f"[odom] holding default pose {self.odom_calib_delay:.1f}s before calibration ...")
+        for _ in range(int(round(self.odom_calib_delay / self.control_dt))):
+            self._hold_default()
+            if self.env.read_controller_input().keys == self.env.controller_mapping["select"]:
+                raise SafetyStop("Select pressed during odom calibration")
+        last_warn = 0.0
+        while True:
+            dof_pos, _, quat, _, _, _, _ = self.env.get_robot_state()
+            odom = self.odom_sub.get_pose_with_age()
+            if odom is not None and odom[2] <= self.odom_timeout:
+                break
+            now = time.time()
+            if now - last_warn >= 1.0:
+                last_warn = now
+                why = "no odometry" if odom is None else f"odometry stale ({odom[2] * 1e3:.0f} ms)"
+                print(f"[yellow][odom] {why}; holding default pose, retrying ... (Select: abort)[/yellow]")
+            if self.env.read_controller_input().keys == self.env.controller_mapping["select"]:
+                raise SafetyStop("Select pressed during odom calibration")
+            self._hold_default()
+        imu_quat = np.asarray(quat, dtype=np.float64)
+        height, (p_ps, q_ps) = self._body_frame_kinematics(dof_pos, imu_quat)
+        self._set_odom_cal(odom[0], odom[1], p_ps, q_ps, height, imu_quat, quatToEuler(quat))
+        print("[green][odom] calibration complete.[/green]")
+
+    def _set_odom_cal(self, o_pos, o_quat, p_ps, q_ps, height, imu_quat, rpy):
+        """FAST-LIO's frame is the sensor start pose (neither gravity- nor heading-
+        aligned): map it so the current pelvis is at (0, 0, height) with the IMU
+        orientation."""
+        p_sp, q_sp = _pose_inv(p_ps, q_ps)
+        p_op, q_op = _pose_mul(o_pos, o_quat, p_sp, q_sp)
+        p_inv, q_inv = _pose_inv(p_op, q_op)
+        self._odom_cal = _pose_mul(np.array([0.0, 0.0, height]), imu_quat, p_inv, q_inv)
+        print(f"[odom] calibrated: pelvis height {height:.3f} m, IMU yaw {rpy[2]:+.3f}")
 
     def _damping(self, until_select=True, max_time=None):
         """Zero stiffness, nominal damping: the robot goes limp slowly (keep the hoist on).
@@ -397,13 +460,8 @@ class RealTimePolicyController:
             # sensor pose in odom frame -> pelvis pose in odom frame
             p_sp, q_sp = _pose_inv(p_ps, q_ps)
             p_op, q_op = _pose_mul(o_pos, o_quat, p_sp, q_sp)
-            if self._odom_cal is None:
-                # FAST-LIO's frame is the sensor start pose (neither gravity- nor
-                # heading-aligned): map it once so the pelvis starts at (0, 0, height)
-                # with the IMU orientation.
-                p_inv, q_inv = _pose_inv(p_op, q_op)
-                self._odom_cal = _pose_mul(np.array([0.0, 0.0, height]), imu_quat, p_inv, q_inv)
-                print(f"[odom] calibrated: pelvis height {height:.3f} m, IMU yaw {rpy[2]:+.3f}")
+            if self._odom_cal is None:   # normally latched at the default pose (reset_robot)
+                self._set_odom_cal(o_pos, o_quat, p_ps, q_ps, height, imu_quat, rpy)
             p_w, q_w = _pose_mul(*self._odom_cal, p_op, q_op)
             root_pos = p_w
             # heading from odom (drift-free), roll/pitch from the IMU
@@ -494,16 +552,30 @@ class RealTimePolicyController:
 
     # ------------------------------------------------------------------ reference
     def _reference_local(self, policy_step, b_edge):
-        """Advance the in-process motion player by one step."""
-        p = self.motion_player
-        auto = (self.motion_start_delay >= 0 and not p.started
+        """Advance the in-process motion player by one step.
+        Stand motion (if any) starts on the first policy step (= right after A);
+        B (or the auto start) plays --motion_npz once the active motion is finished."""
+        main, stand = self.motion_player, self.stand_player
+        if stand is not None and policy_step == 0 and not stand.started:
+            self._active_player = stand
+            print("[motion] A -> stand motion")
+            stand.start(self._root_yaw)
+        active = self._active_player
+        free = not active.started or active.done
+        auto = (self.motion_start_delay >= 0 and not main.started
                 and policy_step * self.control_dt >= self.motion_start_delay)
-        if (b_edge and (not p.started or p.done)) or auto:
+        if (b_edge or auto) and free:
             self._post_motion_steps = 0
-            p.start(self._root_yaw)
-        s = p.step()
+            self._active_player = active = main
+            print("[motion] B -> " + os.path.basename(self.motion_npz))
+            main.start(self._root_yaw)
+        elif b_edge:
+            print(f"[motion] B ignored: '{'stand' if active is stand else 'motion'}' still playing")
+        s = active.step()
         future_raw = s.future_raw if self.spec.needs_future else None
-        return s.action_mimic, future_raw, s.ref_root, s.epoch, s.phase, np.zeros(7), np.zeros(7)
+        # epochs are per player -> tag them so a player switch re-anchors the reference
+        epoch = None if s.epoch is None else (id(active), s.epoch)
+        return s.action_mimic, future_raw, s.ref_root, epoch, s.phase, np.zeros(7), np.zeros(7)
 
     def _reference_redis(self, keys_pressed, dof_pos, ang_vel, rpy):
         """Publish robot state / remote signals and read the motion server's targets."""
@@ -553,9 +625,18 @@ class RealTimePolicyController:
 
     # ------------------------------------------------------------------ main loop
     def run(self):
-        self.reset_robot()
+        try:
+            self.reset_robot()
+        except SafetyStop as e:
+            print(f"[red][safety] STOP: {e}[/red]")
+            self._damping(until_select=False, max_time=2.0)
+            if self.odom_sub is not None:
+                self.odom_sub.close()
+            self.env.close()
+            return
         print("Begin main TWIST2 policy loop. "
-              + ("Press [B] to play the motion, " if self.motion_player is not None else "")
+              + ("Playing the stand motion; " if self.stand_player is not None else "")
+              + ("press [B] to play the motion, " if self.motion_player is not None else "")
               + "[Select] to exit.")
 
         if self.redis_pipeline is not None:
@@ -743,6 +824,12 @@ def main():
     parser.add_argument('--print_odom_hz', type=float, default=0.0,
                         help='Print the received odometry (raw sensor pose + derived root) at this rate [Hz] (0: off)')
     # reference motion
+    parser.add_argument('--stand_npz', type=str, default=None,
+                        help='With --motion_npz: motion played right after A (e.g. A1-Stand); '
+                             'B then plays --motion_npz once it has finished')
+    parser.add_argument('--odom_calib_delay', type=float, default=5.0,
+                        help='--root_source odom: hold the default pose this long [s] after START, '
+                             'then calibrate the odometry')
     parser.add_argument('--motion_npz', type=str, default=None,
                         help='Precomputed motion (export_motion_ref.py) played in-process; '
                              'without it the Redis motion server is used')
@@ -756,7 +843,7 @@ def main():
     # dry run without the robot
     parser.add_argument('--mock', action='store_true',
                         help='Run against a MuJoCo stand-in of the robot (no unitree_interface / ROS2)')
-    parser.add_argument('--mock_buttons', type=str, default='start@0,A@3,B@5',
+    parser.add_argument('--mock_buttons', type=str, default='start@0,A@8,B@12',
                         help='--mock: scripted remote buttons, name@sim_seconds')
     parser.add_argument('--mock_realtime', action='store_true',
                         help='--mock: pace the loop in real time (default: as fast as possible)')
@@ -770,7 +857,7 @@ def main():
 
     print("Starting TWIST2 real robot controller" + (" [MOCK]" if args.mock else "") + "...")
     for k in ("policy", "obs_cfg", "config", "xml", "device", "net", "use_hand", "root_source",
-              "motion_npz", "kp_scale", "kd_scale", "initial_gain_scale", "record_proprio"):
+              "motion_npz", "stand_npz", "kp_scale", "kd_scale", "initial_gain_scale", "record_proprio"):
         print(f"  {k}: {getattr(args, k)}")
 
     env, odom_source = None, None
@@ -809,6 +896,8 @@ def main():
         odom_timeout=args.odom_timeout,
         print_odom_hz=args.print_odom_hz,
         motion_npz=args.motion_npz,
+        stand_npz=args.stand_npz,
+        odom_calib_delay=args.odom_calib_delay,
         motion_start_delay=args.motion_start_delay,
         motion_blend_in_time=args.motion_blend_in_time,
         exit_after_motion=args.exit_after_motion,

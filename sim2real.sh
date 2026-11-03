@@ -7,7 +7,8 @@
 #            --steps 5 --blend_in_time 1.0 --playback_speed 1.0 --out ../assets/motions/xxx.npz
 #   2. robot: hoist, power on, zero-torque, L2+R2 (debug mode); FAST-LIO publishing /Odometry
 #   3. bash sim2real.sh
-#      remote: START -> default pose, A -> policy, B -> play motion (again after it ends),
+#      remote: START -> default pose (+5 s hold, odom calibration), A -> policy + STAND_NPZ,
+#      B -> play MOTION_NPZ (again after it ends),
 #      Select -> damping + exit. Terminal keys 2..9 / X raise the PD gain (starts at 10%).
 #
 #   no robot: MOCK=1 bash sim2real.sh [--record_video [--video_ref] [--video_path X.mp4]]
@@ -25,7 +26,8 @@ ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+diff-pos-b+future-pos-h+futur
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/ft/prop5+future-pos-h+future-anchor_mimic-body_w20.0_sig0.3sq_ft2000.onnx}
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/ft/prop5+diff-pos-b+future-pos-h+future-anchor_upde-sig-per_mimic-body-w5.0_sig-init0.3sq_ft1000.onnx}
 
-motion_npz=${MOTION_NPZ:-${SCRIPT_DIR}/assets/motions/A1-Stand_poses.npz}
+motion_npz=${MOTION_NPZ:-${SCRIPT_DIR}/assets/motions/A1-Stand_poses.npz}   # B
+stand_npz=${STAND_NPZ:-${SCRIPT_DIR}/assets/motions/A1-Stand_poses.npz}     # A (right after the policy starts)
 
 root_source=${ROOT_SOURCE:-odom}
 PY=${PY:-python}                              # real
@@ -37,6 +39,7 @@ net=eth0
 
 ckpt_path=$(realpath "${ckpt_path}") || exit 1
 motion_npz=$(realpath "${motion_npz}") || exit 1
+stand_npz=$(realpath "${stand_npz}") || exit 1
 
 # if [ "${root_source}" = "odom" ] && [ -z "${MOCK:-}" ] && [ -f /opt/ros/humble/setup.bash ]; then
 #     source /opt/ros/humble/setup.bash
@@ -66,6 +69,7 @@ cd "${SCRIPT_DIR}/deploy_real"
 "$PY" "${script}" \
     --policy "${ckpt_path}" \
     --motion_npz "${motion_npz}" \
+    --stand_npz "${stand_npz}" \
     --net "${net}" \
     --device cpu \
     --root_source "${root_source}" \
