@@ -13,21 +13,23 @@
 #   no robot: MOCK=1 bash sim2real.sh [--record_video [--video_ref] [--video_path X.mp4]]
 #      --record_video runs deploy_real/mock_video.py (mp4 -> logs/real/, MOCK only)
 
+
 # source ~/miniconda3/bin/activate twist2
 
 set -u
 SCRIPT_DIR=$(dirname $(realpath $0))
 
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+future-pos-h+future-anchor_mimic-body_w20.0_sig0.3sq.onnx}
-ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+diff-pos-b+future-pos-h+future-anchor_upde-sig-per_mimic-body-w5.0_sig-init0.3sq.onnx}
+# ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+diff-pos-b+future-pos-h+future-anchor_upde-sig-per_mimic-body-w5.0_sig-init0.3sq.onnx}
 
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/ft/prop5+future-pos-h+future-anchor_mimic-body_w20.0_sig0.3sq_ft2000.onnx}
+ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/ft/prop5+diff-pos-b+future-pos-h+future-anchor_upde-sig-per_mimic-body-w5.0_sig-init0.3sq_ft1000.onnx}
 
 motion_npz=${MOTION_NPZ:-${SCRIPT_DIR}/assets/motions/LAFAN1_fight1_subject3_chunk_0001-0002.npz}
 
 root_source=${ROOT_SOURCE:-odom}
-# PY=${PY:-python}
-PY=/workspace/isaaclab/_isaac_sim/python.sh
+# PY=${PY:-python}                              # real
+PY=/workspace/isaaclab/_isaac_sim/python.sh     # MOCK
 
 # net=enp0s31f6
 # net=eno1
