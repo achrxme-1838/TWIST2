@@ -1,0 +1,32 @@
+future_steps: 10
+future_interval: 5
+terms:
+- name: base_ang_vel
+  history: 15
+  scale: 0.25
+  clip: [-100.0, 100.0]
+- name: base_roll_pitch
+  history: 15
+  clip: [-100.0, 100.0]
+- name: joint_pos_rel
+  history: 15
+  clip: [-100.0, 100.0]
+- name: joint_vel_rel
+  history: 15
+  scale: 0.05
+  clip: [-100.0, 100.0]
+  params:
+    mask_joint_names: [.*_ankle_pitch_joint, .*_ankle_roll_joint]
+- name: last_action
+  history: 15
+  clip: [-100.0, 100.0]
+- name: diff_body_pos_b
+  history: 15
+  scale: 1.0
+  params: {randomize_motion_ref_xyz: true}
+- name: future_motion_pos_h
+  params: {num_steps: 1}
+- name: future_motion_anchor
+  params: {num_steps: 1}
+obs_dim: 2970
+source_run: distill_prop5+diff-pos-b+future-pos-h+future-anchor_upde-sig-per_mimic-w5.0-sig-init0.3sq_PHUMArepre_2026-11-02_14-47-50
