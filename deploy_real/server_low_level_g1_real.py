@@ -23,6 +23,7 @@ Remote: START -> move to default pose, A -> policy loop, B -> start (or restart)
 motion, Select -> damping + exit. Terminal keys 2..9 / X set the PD gain scale.
 """
 import argparse
+import builtins
 import json
 import os
 import time
@@ -151,6 +152,7 @@ class RealTimePolicyController:
                  odom_body="torso_link",
                  odom_offset=MID360_OFFSET,
                  odom_timeout=0.3,
+                 print_odom_hz=0.0,
                  robot="unitree_g1_with_hands",
                  motion_npz=None,
                  motion_start_delay=-1.0,
@@ -275,6 +277,8 @@ class RealTimePolicyController:
         # ----- world root estimation (see module docstring) -----
         self.root_source = root_source
         self.odom_timeout = float(odom_timeout)
+        self.print_odom_period = 1.0 / print_odom_hz if print_odom_hz > 0 else None
+        self._last_odom_print = 0.0
         self.odom_sub = None
         self._odom_body_id = self.model.body(odom_body).id
         self._odom_off_pos = np.asarray(odom_offset[:3], dtype=np.float64)
@@ -404,6 +408,14 @@ class RealTimePolicyController:
             root_pos = p_w
             # heading from odom (drift-free), roll/pitch from the IMU
             root_quat = rpy_to_quat(float(rpy[0]), float(rpy[1]), yaw_from_quat(q_w))
+            if self.print_odom_period is not None:
+                now = time.time()
+                if now - self._last_odom_print >= self.print_odom_period:
+                    self._last_odom_print = now
+                    o_rpy = quatToEuler(o_quat)
+                    builtins.print(f"[odom] raw pos [{o_pos[0]:+.3f} {o_pos[1]:+.3f} {o_pos[2]:+.3f}] "
+                          f"rpy [{o_rpy[0]:+.3f} {o_rpy[1]:+.3f} {o_rpy[2]:+.3f}] age {age * 1e3:.0f} ms"
+                          f" -> root [{p_w[0]:+.3f} {p_w[1]:+.3f} {p_w[2]:+.3f}] yaw {yaw_from_quat(q_w):+.3f}")
             ref_root_xy_w = self._compute_ref_root_xy_w(root_pos[:2], ref_root, ref_epoch)
 
         self._fk(root_pos, root_quat, dof_pos)
@@ -728,6 +740,8 @@ def main():
                         help='Odometry frame pose in --odom_body (default: URDF mid360_joint)')
     parser.add_argument('--odom_timeout', type=float, default=0.3,
                         help='Odometry older than this [s] -> damping stop')
+    parser.add_argument('--print_odom_hz', type=float, default=0.0,
+                        help='Print the received odometry (raw sensor pose + derived root) at this rate [Hz] (0: off)')
     # reference motion
     parser.add_argument('--motion_npz', type=str, default=None,
                         help='Precomputed motion (export_motion_ref.py) played in-process; '
@@ -793,6 +807,7 @@ def main():
         odom_body=args.odom_body,
         odom_offset=args.odom_offset,
         odom_timeout=args.odom_timeout,
+        print_odom_hz=args.print_odom_hz,
         motion_npz=args.motion_npz,
         motion_start_delay=args.motion_start_delay,
         motion_blend_in_time=args.motion_blend_in_time,
