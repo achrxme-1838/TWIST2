@@ -2,16 +2,21 @@
 """Precompute a reference motion for in-process playback.
 Takes the same flags as server_motion_lib.py
 
-    python export_motion_ref.py --motion_file X.pkl --obs_cfg ckpt.yaml --steps 5 --out X.npz
+    python export_motion_ref.py --motion_file X.pkl --obs_cfg ckpt.yaml --steps 5 [--out X.npz]
+
+If --out is omitted, saves to assets/motions/<motion_name>.npz
+(<motion_name> = --motion_file basename without .pkl).
 """
 import argparse
 import json
 import os
+import sys
 
 import numpy as np
 import torch
 
-from pose.utils.motion_lib_pkl import MotionLib
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pose"))
+from pose.utils.motion_lib_pkl import MotionLib  # noqa: E402
 from data_utils.rot_utils import euler_from_quaternion_torch
 from cfg import g1_29dof_cfg as cfg
 from policy_spec import load_spec
@@ -104,7 +109,8 @@ def export(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--motion_file", required=True, help="*.pkl motion file for MotionLib")
-    parser.add_argument("--out", required=True, help="Output .npz")
+    parser.add_argument("--out", type=str, default=None,
+                        help="Output .npz (default: assets/motions/<motion_name>.npz)")
     parser.add_argument("--obs_cfg", type=str, default=None,
                         help="Policy spec yaml of the controller's checkpoint (future-frame schedule).")
     parser.add_argument("--robot", type=str, default="unitree_g1_with_hands",
@@ -123,4 +129,9 @@ if __name__ == "__main__":
     parser.add_argument("--redis_ip", type=str, default=None)
     parser.add_argument("--vis", action="store_true")
     parser.add_argument("--use_remote_control", action="store_true")
-    export(parser.parse_args())
+    args = parser.parse_args()
+    if args.out is None:
+        motion_name = os.path.splitext(os.path.basename(args.motion_file))[0]  # strip .pkl
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        args.out = os.path.join(repo_root, "assets", "motions", f"{motion_name}.npz")
+    export(args)

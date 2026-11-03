@@ -60,6 +60,7 @@ def cfg_from_args(args, need_motion=True) -> FinetuneCfg:
     if args.critic_spec:
         cfg.paths.critic_spec = args.critic_spec
     apply_overrides(cfg, args.set)
+    cfg.update_sigma.enabled = False
     cfg.resolve()
     if need_motion and not cfg.paths.motion_file:
         raise SystemExit("--motion is required")

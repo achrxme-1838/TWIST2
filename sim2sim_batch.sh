@@ -10,24 +10,25 @@ PY=/workspace/isaaclab/_isaac_sim/python.sh
 # motion_file=${MOTION:-${SCRIPT_DIR}/assets/LAAM/G6-axe_kick_poses.pkl}
 # motion_file=${MOTION:-${SCRIPT_DIR}/assets/LAAM/Subject_69_F_21_poses.pkl}
 
-motion_file=${MOTION:-${SCRIPT_DIR}/assets/PHUMA/LAFAN1_walk1_subject1_chunk_0030.pkl}
+# motion_file=${MOTION:-${SCRIPT_DIR}/assets/PHUMA/LAFAN1_walk1_subject1_chunk_0030.pkl}
 # motion_file=${MOTION:-${SCRIPT_DIR}/assets/PHUMA/humanml_007615_chunk_0002.pkl}
 # motion_file=${MOTION:-${SCRIPT_DIR}/assets/PHUMA/idea400_Simultaneously_walking_and_Kicking_a_soccer_ball_clip1_chunk_0000.pkl}
 # motion_file=${MOTION:-${SCRIPT_DIR}/assets/PHUMA/idea400_standing_during_Shuttlecock_Kicking_1_clip1_chunk_0000.pkl}
-
-# motion_file=${MOTION:-${SCRIPT_DIR}/assets/CLAW/CLAW_locrawl_0.pkl}
+motion_file=${MOTION:-${SCRIPT_DIR}/assets/PHUMA/fitness_subset_0042_Jumping_Jack_To_Pop_Squat_clip_30.pkl}
 
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+GMT+diff-pos-b-deploy_hist25_futu1.onnx}
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+GMT+diff-pos-b_hist25_futu1.onnx}
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+future-pos-h+future-anchor_hist15_futu1.onnx}
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+future-pos-h+future-anchor_feet-pos-exp.onnx}
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+future-pos-h+future-anchor_mimic-body_w20.0_sig0.3sq.onnx}
+ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+future-pos-h+future-anchor_upde-sig-per_mimic-body-w5.0_sig-init0.3sq.onnx}
 
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/ft/prop5+GMT+diff-pos-b-deploy_hist25_futu1_ft3000.onnx}
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/ft/prop5+future-pos-h+future-anchor_hist15_futu1_ft3000.onnx}
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/ft/prop5+future-pos-h+future-anchor_feet-pos-exp_ft3000.onnx}
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/ft/prop5+future-pos-h+future-anchor_feet-pos-exp_weight40.0_ft500.onnx}
-ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/ft/prop5+future-pos-h+future-anchor_mimic-body_w20.0_sig0.3sq_ft2000.onnx}
+# ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/ft/prop5+future-pos-h+future-anchor_mimic-body_w20.0_sig0.3sq_ft2000.onnx}
+# ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/ft/prop5+future-pos-h+future-anchor_upde-sig-per_mimic-body-w5.0_sig-init0.3sq_ft3000.onnx}
 
 video_path=${VIDEO:-}
 # MOTION_SOURCE=local (default): precompute the reference (export_motion_ref.py) and play it

@@ -9,11 +9,15 @@ step counts and endpoints.
     python check_motion_player.py --npz X.npz [--yaws 0 1.2 -2.9]
 """
 import argparse
+import os
+import sys
 
 import numpy as np
 import torch
 
-from pose.utils.motion_lib_pkl import MotionLib
+# `pose` lives in ../pose (sim2sim_batch.sh puts it on PYTHONPATH); also runnable without it.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pose"))
+from pose.utils.motion_lib_pkl import MotionLib  # noqa: E402
 from data_utils.params import DEFAULT_MIMIC_OBS
 from motion_player import BLEND, IDLE, MOTION, RETURN, LocalMotionPlayer
 from server_motion_lib import build_mimic_obs

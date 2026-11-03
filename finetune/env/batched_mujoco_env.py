@@ -64,7 +64,9 @@ class BatchedG1MimicVecEnv(VecEnv):
                                dtype=np.int64)
         self.rewards = BatchedRewardComputer(cfg.reward, self.step_dt,
                                             self.core.soft_joint_limits(ec.soft_joint_limit_factor),
-                                            contact_ids, ec.contact_force_threshold, self.device)
+                                            contact_ids, ec.contact_force_threshold, self.device,
+                                            update_sigma=cfg.update_sigma, num_motions=self.motions.num_motions,
+                                            num_envs=N, motion_names=list(self.motions.names))
         self.terminator = BatchedTerminationChecker(cfg.termination)
         self.term_names = self.rewards.term_names
 
@@ -115,7 +117,8 @@ class BatchedG1MimicVecEnv(VecEnv):
         robot = self.core.state()
         ref_frame = self.motions.frame(self.mid, self.t)
         ref_body = self.motions.body_state(self.mid, self.t)
-        rewards, raw = self.rewards(robot, ref_body, ref_frame.root_quat, self.last_action, self.prev_action)
+        rewards, raw = self.rewards(robot, ref_body, ref_frame.root_quat, self.last_action, self.prev_action,
+                                    mid=self.mid)
         diverged, max_dist = self.terminator.diverged(robot, ref_body)
 
         length = self.motions.length(self.mid)

@@ -106,8 +106,9 @@ def build_optimizer(policy, cfg: FinetuneCfg):
     return opt, actor_lr
 
 
-def save_checkpoint(path: str, policy, optimizer, it: int, cfg: FinetuneCfg, learning_rate: float):
-    torch.save({
+def save_checkpoint(path: str, policy, optimizer, it: int, cfg: FinetuneCfg, learning_rate: float,
+                    adaptive_sigma=None):
+    ck = {
         "iter": it,
         "cfg": cfg.to_dict(),
         "model_state_dict": policy.state_dict(),
@@ -116,7 +117,11 @@ def save_checkpoint(path: str, policy, optimizer, it: int, cfg: FinetuneCfg, lea
         "merged_critic_state_dict": policy.merged_critic().state_dict(),
         "std": policy.std.detach().cpu(),
         "learning_rate": learning_rate,
-    }, path)
+    }
+    if adaptive_sigma is not None:
+        # training-only state: export.py and the eval scripts ignore it
+        ck["adaptive_sigma"] = adaptive_sigma.state_dict()
+    torch.save(ck, path)
 
 
 def main():
@@ -167,6 +172,7 @@ def main():
     alg.init_storage("rl", env.num_envs, cfg.ppo.num_steps_per_env,
                      [env.num_actor_obs], [env.num_critic_obs], [env.num_actions])
 
+    adaptive_sigma = getattr(env.rewards, "adaptive_sigma", None)
     start_it = 0
     if cfg.train.resume:
         ck = torch.load(cfg.train.resume, map_location=device, weights_only=False)
@@ -177,6 +183,13 @@ def main():
         for g in alg.optimizer.param_groups:
             g["lr"] = alg.learning_rate
         start_it = int(ck.get("iter", 0)) + 1
+        if adaptive_sigma is not None:
+            if "adaptive_sigma" in ck:
+                adaptive_sigma.load_state_dict(ck["adaptive_sigma"])
+                print("[train] resumed adaptive sigma state")
+            else:
+                print("[train] WARNING: resume checkpoint has no adaptive sigma state; "
+                      "the factors restart from sigma_init")
         print(f"[train] resumed from {cfg.train.resume} @ iter {start_it}")
 
     obs, extras = env.get_observations()
@@ -251,6 +264,8 @@ def main():
                 for k, dq in ep_terms.items():
                     if dq:
                         scalars[f"Episode/rew_{k}"] = statistics.fmean(dq)
+            if adaptive_sigma is not None:
+                scalars.update(adaptive_sigma.log_dict())
             logger.log(it, scalars)
             print(f"it {it:5d} | {'warmup ' if warmup else 'lora   '}| step_rew {scalars['Train/mean_step_reward']:7.4f} "
                   f"| ep_rew {scalars.get('Episode/mean_reward', float('nan')):8.3f} "
@@ -261,7 +276,8 @@ def main():
                   f"| std {scalars['Policy/mean_noise_std']:.3f} | fps {fps:6.0f} | {time.time() - t_start:6.0f}s")
 
         if (it + 1) % cfg.train.save_interval == 0 or it + 1 == cfg.train.max_iterations:
-            save_checkpoint(os.path.join(run_dir, f"model_{it + 1}.pt"), policy, alg.optimizer, it, cfg, alg.learning_rate)
+            save_checkpoint(os.path.join(run_dir, f"model_{it + 1}.pt"), policy, alg.optimizer, it, cfg, alg.learning_rate,
+                            adaptive_sigma)
 
     logger.close()
     print(f"[train] done. checkpoints in {run_dir}; export with finetune/tasks/export.py --ckpt <model_N.pt>")

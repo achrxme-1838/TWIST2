@@ -86,7 +86,7 @@ class RewardCfg:
     terms: Dict[str, float] = field(default_factory=lambda: {
         # -- task
         "root_orientation":             0.5,
-        "mimic_extended_body_pos_exp": 20.0,
+        "mimic_extended_body_pos_exp":  5.0,
         "mimic_extended_body_ori_exp":  1.0,
         "mimic_body_lin_vel_exp":       1.0,
         "mimic_body_ang_vel_exp":       1.0,
@@ -97,9 +97,9 @@ class RewardCfg:
         "undesired_contacts":          -0.1,
     })
 
-    # exp-kernel widths; each is read only by the term named in the comment
     root_orientation_sigma: float = 0.4 ** 2
-    body_pos_sigma: float = 0.3 ** 2
+    # body_pos_sigma: float = 0.3 ** 2
+    body_pos_sigma: float = 0.01 ** 2
     body_ori_sigma: float = 0.4 ** 2
     body_lin_vel_sigma: float = 1.0 ** 2
     body_ang_vel_sigma: float = 3.14 ** 2
@@ -108,6 +108,31 @@ class RewardCfg:
         default_factory=lambda: ["left_ankle_roll_link", "right_ankle_roll_link"])
 
     scale_by_dt: bool = True
+
+
+SIGMA_FIELDS: Dict[str, str] = {
+    "root_orientation":            "root_orientation_sigma",
+    "mimic_extended_body_pos_exp": "body_pos_sigma",
+    "mimic_extended_body_ori_exp": "body_ori_sigma",
+    "mimic_body_lin_vel_exp":      "body_lin_vel_sigma",
+    "mimic_body_ang_vel_exp":      "body_ang_vel_sigma",
+    "feet_pos_exp":                "feet_pos_sigma",
+}
+
+
+@dataclass
+class UpdateSigmaCfg:
+    enabled: bool = False
+    per_motion: bool = True
+    alpha: float = 1e-3         # EMA coef
+    min_sigma: float = 1e-4
+
+    # per_motion only
+    t_warmup: int = 200
+
+    terms: Dict[str, Optional[float]] = field(default_factory=lambda: {
+        "mimic_extended_body_pos_exp": 0.3**2,
+    })
 
 
 @dataclass
@@ -142,7 +167,7 @@ class CriticCfg:
 
 @dataclass
 class PPOCfg:
-    num_steps_per_env: int = 1024
+    num_steps_per_env: int = 24
     num_learning_epochs: int = 5
     num_mini_batches: int = 4
     clip_param: float = 0.2
@@ -176,6 +201,7 @@ class FinetuneCfg:
     motion: MotionCfg = field(default_factory=MotionCfg)
     env: EnvCfg = field(default_factory=EnvCfg)
     reward: RewardCfg = field(default_factory=RewardCfg)
+    update_sigma: UpdateSigmaCfg = field(default_factory=UpdateSigmaCfg)
     termination: TerminationCfg = field(default_factory=TerminationCfg)
     lora: LoRACfg = field(default_factory=LoRACfg)
     critic: CriticCfg = field(default_factory=CriticCfg)
@@ -212,8 +238,42 @@ class FinetuneCfg:
             )
         if self.ppo.schedule not in ("adaptive", "fixed"):
             raise ValueError(f"ppo.schedule must be adaptive or fixed, got {self.ppo.schedule!r}")
+        self._resolve_update_sigma()
         self.paths.resolve(self.critic.source)
         return self
+
+    def _resolve_update_sigma(self):
+        """Validate ``update_sigma`` and write each sigma_init into ``reward``."""
+        u = self.update_sigma
+        if not u.enabled:
+            return
+        if self.env.backend != "gpu":
+            raise ValueError(
+                "update_sigma.enabled=True needs env.backend=gpu; the cpu env does not implement "
+                "the adaptive tracking factor. Add env.backend=gpu or update_sigma.enabled=false."
+            )
+        if not 0.0 < u.alpha <= 1.0:
+            raise ValueError(f"update_sigma.alpha must be in (0, 1], got {u.alpha}.")
+        if u.min_sigma <= 0.0:
+            raise ValueError(f"update_sigma.min_sigma must be positive, got {u.min_sigma}.")
+        if not u.terms:
+            raise ValueError("update_sigma.enabled=True but update_sigma.terms is empty.")
+        if u.per_motion and u.t_warmup < 1:
+            raise ValueError(f"update_sigma.t_warmup must be >= 1, got {u.t_warmup}.")
+        for term_name, sigma_init in u.terms.items():
+            if term_name not in SIGMA_FIELDS:
+                raise ValueError(
+                    f"update_sigma.terms lists '{term_name}', which is not an exp(-x / sigma) "
+                    f"tracking term. Adaptable terms: {list(SIGMA_FIELDS)}."
+                )
+            # A term missing from reward.terms is never computed, so its factor would never move.
+            if not self.reward.terms.get(term_name):
+                raise ValueError(
+                    f"update_sigma.terms lists '{term_name}', which is not an active reward term "
+                    "(absent from reward.terms or weight 0)."
+                )
+            if sigma_init is not None:
+                setattr(self.reward, SIGMA_FIELDS[term_name], float(sigma_init))
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)

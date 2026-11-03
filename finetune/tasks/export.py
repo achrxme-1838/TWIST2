@@ -1,3 +1,8 @@
+"""
+Usage:
+    python export.py --ckpt logs/finetune/<run>/model_N.pt
+"""
+
 from __future__ import annotations
 
 import argparse
