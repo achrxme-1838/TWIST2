@@ -14,7 +14,7 @@
 #      --record_video runs deploy_real/mock_video.py (mp4 -> logs/real/, MOCK only)
 
 
-# source ~/miniconda3/bin/activate twist2
+source ~/miniconda3/bin/activate twist2
 
 set -u
 SCRIPT_DIR=$(dirname $(realpath $0))
