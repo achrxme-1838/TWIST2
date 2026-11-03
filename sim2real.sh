@@ -70,6 +70,7 @@ cd "${SCRIPT_DIR}/deploy_real"
     --device cpu \
     --root_source "${root_source}" \
     --odom_topic /dreamstep_odom_grav \
+    --print_odom_hz 2.0 \
     --record_proprio \
     "${mock_args[@]}" \
     "${extra_args[@]}"
