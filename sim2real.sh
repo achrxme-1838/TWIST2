@@ -20,16 +20,16 @@ set -u
 SCRIPT_DIR=$(dirname $(realpath $0))
 
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+future-pos-h+future-anchor_mimic-body_w20.0_sig0.3sq.onnx}
-# ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+diff-pos-b+future-pos-h+future-anchor_upde-sig-per_mimic-body-w5.0_sig-init0.3sq.onnx}
+ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+diff-pos-b+future-pos-h+future-anchor_upde-sig-per_mimic-body-w5.0_sig-init0.3sq.onnx}
 
 # ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/ft/prop5+future-pos-h+future-anchor_mimic-body_w20.0_sig0.3sq_ft2000.onnx}
-ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/ft/prop5+diff-pos-b+future-pos-h+future-anchor_upde-sig-per_mimic-body-w5.0_sig-init0.3sq_ft1000.onnx}
+# ckpt_path=${CKPT:-${SCRIPT_DIR}/assets/ckpts/ft/prop5+diff-pos-b+future-pos-h+future-anchor_upde-sig-per_mimic-body-w5.0_sig-init0.3sq_ft1000.onnx}
 
-motion_npz=${MOTION_NPZ:-${SCRIPT_DIR}/assets/motions/LAFAN1_fight1_subject3_chunk_0001-0002.npz}
+motion_npz=${MOTION_NPZ:-${SCRIPT_DIR}/assets/motions/A1-Stand_poses.npz}
 
 root_source=${ROOT_SOURCE:-odom}
-# PY=${PY:-python}                              # real
-PY=/workspace/isaaclab/_isaac_sim/python.sh     # MOCK
+PY=${PY:-python}                              # real
+# PY=/workspace/isaaclab/_isaac_sim/python.sh     # MOCK
 
 # net=enp0s31f6
 # net=eno1
@@ -38,9 +38,9 @@ net=eth0
 ckpt_path=$(realpath "${ckpt_path}") || exit 1
 motion_npz=$(realpath "${motion_npz}") || exit 1
 
-if [ "${root_source}" = "odom" ] && [ -z "${MOCK:-}" ] && [ -f /opt/ros/humble/setup.bash ]; then
-    source /opt/ros/humble/setup.bash
-fi
+# if [ "${root_source}" = "odom" ] && [ -z "${MOCK:-}" ] && [ -f /opt/ros/humble/setup.bash ]; then
+#     source /opt/ros/humble/setup.bash
+# fi
 
 # no robot (MuJoCo)
 mock_args=()
@@ -69,7 +69,7 @@ cd "${SCRIPT_DIR}/deploy_real"
     --net "${net}" \
     --device cpu \
     --root_source "${root_source}" \
-    --odom_topic /Odometry \
+    --odom_topic /dreamstep_odom_grav \
     --record_proprio \
     "${mock_args[@]}" \
     "${extra_args[@]}"
