@@ -11,6 +11,7 @@ import finetune.mdp.critic_terms   # noqa: F401  (CPU registry: term widths for 
 from finetune.env.batched_core import BatchedG1SimCore
 from finetune.helper.torch_math import quat_to_rpy, xyzw_to_wxyz
 from finetune.mdp.batched_obs import BatchedObsBuilder, BatchedObsContext
+from finetune.mdp.odom_delay import OdomDelayBuffer, drift_kwargs
 from finetune.mdp.batched_rewards import BatchedRewardComputer, BatchedTerminationChecker
 from finetune.motion_data.batched_motion_ref import BatchedMotionSet, BatchedRefFK
 from finetune.motion_data.motion_ref import MotionSet, RefFK
@@ -89,6 +90,22 @@ class BatchedG1MimicVecEnv(VecEnv):
         self._obs, self._critic_obs = z(N, self.num_actor_obs), z(N, self.num_critic_obs)
         self._wall_t0, self._wall_steps = None, 0
 
+        # odometry delay on the actor obs (terms with use_odom_delay: true); critic keeps the truth
+        odom_terms = [t.name for t in self.actor_spec.terms
+                      if bool((t.params or {}).get("use_odom_delay", False))]
+        od = cfg.odom_delay
+        self.odom: Optional[OdomDelayBuffer] = None
+        if od.enabled and odom_terms:
+            self.odom = OdomDelayBuffer(N, od.update_period_steps, od.latency_steps, self.device,
+                                        seed=ec.seed, drift=drift_kwargs(od), dt=self.control_dt)
+        if verbose:
+            if self.odom is not None:
+                print(f"[env] {self.odom.describe()} -> {odom_terms}")
+            elif odom_terms:
+                print(f"[env] odom delay OFF: actor terms {odom_terms} use the true pelvis pose")
+            elif od.enabled:
+                print("[env] odom delay: no actor term has use_odom_delay, nothing to delay")
+
         if verbose:
             print(self.actor_builder.describe())
             print("critic " + self.critic_builder.describe())
@@ -115,6 +132,8 @@ class BatchedG1MimicVecEnv(VecEnv):
         self.t = self.t0 + self.step_count.to(self.t0.dtype) * self.control_dt
 
         robot = self.core.state()
+        if self.odom is not None:
+            self.odom.step(robot.root_pos, robot.root_quat)   # envs reset below are re-initialised
         ref_frame = self.motions.frame(self.mid, self.t)
         ref_body = self.motions.body_state(self.mid, self.t)
         rewards, raw = self.rewards(robot, ref_body, ref_frame.root_quat, self.last_action, self.prev_action,
@@ -207,6 +226,9 @@ class BatchedG1MimicVecEnv(VecEnv):
                            fr.dof_pos, fr.dof_vel)
         self.actor_builder.reset(ids)
         self.critic_builder.reset(ids)
+        if self.odom is not None:
+            # fresh odometry at the reset pose, random update phase
+            self.odom.init(ids, self.core.qpos[ids][:, 0:3], self.core.qpos[ids][:, 3:7])
 
         # deploy odom anchor: world origin latched at the robot root when the first reference
         # frame is published (t0 + mimic offset, or t0 when disabled)
@@ -251,6 +273,7 @@ class BatchedG1MimicVecEnv(VecEnv):
             future = (f_pos, xyzw_to_wxyz(f_rot_xyzw), f_dof, f_lin, f_ang)
 
         length = self.motions.length(self.mid)
+        est_pelvis = self.odom.pelvis_pose(robot.root_quat) if self.odom is not None else None
         return BatchedObsContext(
             static=self.obs_static, num_envs=self.num_envs, device=self.device,
             dof_pos_isaac=robot.dof_pos_isaac, dof_vel_isaac=robot.dof_vel_isaac,
@@ -260,7 +283,8 @@ class BatchedG1MimicVecEnv(VecEnv):
             ref_root_xy_w=ref_root_xy_w, anchor_delta_xy=self.anchor_delta_xy, ref_fk=self.ref_fk,
             motion_phase=torch.where(length > 0, self.t / length.clamp_min(1e-12),
                                      torch.ones_like(self.t)),
-            time_left=(length - self.t).clamp_min(0.0))
+            time_left=(length - self.t).clamp_min(0.0),
+            est_pelvis=est_pelvis)
 
     def _write_obs(self):
         ctx = self._context()

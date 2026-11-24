@@ -14,7 +14,7 @@ class PathsCfg:
     student_pt: str = ""       # default: assets/pt/<name>.pt
     actor_spec: str = ""       # default: assets/pt/<name>.yaml, then assets/ckpts/<name>.yaml
     critic_spec: str = ""      # default by critic.source: specs/critic_default.yaml (scratch) / critic_teacher.yaml (teacher)
-    motion_file: str = ""      # integrated joblib pkl (many motions) -- required
+    motion_file: str = "~/isaaclab_ws/DEX_RL_LAB_PHUMA/data_processing/motion_retargeting/data/integrated_motions/PHUMA_rt-v30_ap0.99.pkl"
     xml: str = os.path.join(TWIST2_ROOT, "assets", "g1", "g1_sim2sim_29dof.xml")
     log_root: str = os.path.join(TWIST2_ROOT, "logs", "finetune")
     export_dir: str = os.path.join(TWIST2_ROOT, "assets", "ckpts", "ft")              # ONNX (+ spec) for the deploy servers
@@ -64,7 +64,7 @@ class MotionCfg:
 
 @dataclass
 class EnvCfg:
-    num_envs: int = 1
+    num_envs: int = 4096
     control_hz: int = 50
     sim_dt: float = 0.001
     episode_length_s: float = 20.0
@@ -74,7 +74,7 @@ class EnvCfg:
     kd_scale: float = 1.0
     reset_root_z_offset: float = 0.03
     realtime: bool = False
-    backend: str = "cpu"                # cpu (env/mujoco_env.py) / gpu (mujoco_warp, env/batched_mujoco_env.py)
+    backend: str = "gpu"                # cpu (env/mujoco_env.py) / gpu (mujoco_warp, env/batched_mujoco_env.py)
     contact_force_threshold: float = 1.0
     contact_body_exclude: List[str] = field(default_factory=lambda: [".*ankle.*", ".*wrist.*"])
     soft_joint_limit_factor: float = 0.9
@@ -86,13 +86,16 @@ class RewardCfg:
     terms: Dict[str, float] = field(default_factory=lambda: {
         # -- task
         "root_orientation":             0.5,
-        "mimic_extended_body_pos_exp":  5.0,
+        # "mimic_extended_body_pos_exp":  5.0,
+        "mimic_extended_upper_body_pos_exp": 3.0,
+        "mimic_extended_lower_body_pos_exp": 2.0,
         "mimic_extended_body_ori_exp":  1.0,
         "mimic_body_lin_vel_exp":       1.0,
         "mimic_body_ang_vel_exp":       1.0,
         # "feet_pos_exp":                40.0,
         # -- regularisation
-        "action_rate":                 -0.3,
+        # "action_rate":                 -0.3,
+        "action_rate":                 -0.4,
         "joint_pos_limits":           -10.0,
         "undesired_contacts":          -0.1,
     })
@@ -100,12 +103,31 @@ class RewardCfg:
     root_orientation_sigma: float = 0.4 ** 2
     # body_pos_sigma: float = 0.3 ** 2
     body_pos_sigma: float = 0.01 ** 2
+    upper_body_pos_sigma: float = 0.3 ** 2
+    lower_body_pos_sigma: float = 0.3 ** 2
     body_ori_sigma: float = 0.4 ** 2
     body_lin_vel_sigma: float = 1.0 ** 2
     body_ang_vel_sigma: float = 3.14 ** 2
     feet_pos_sigma: float = 0.045 ** 2
     feet_body_names: List[str] = field(
         default_factory=lambda: ["left_ankle_roll_link", "right_ankle_roll_link"])
+    upper_body_names: List[str] = field(default_factory=lambda: [
+        "waist_yaw_link", "waist_roll_link", "torso_link",
+        "left_shoulder_pitch_link", "left_shoulder_roll_link",
+        "left_shoulder_yaw_link", "left_elbow_link",
+        "left_wrist_roll_link", "left_wrist_pitch_link", "left_wrist_yaw_link",
+        "right_shoulder_pitch_link", "right_shoulder_roll_link",
+        "right_shoulder_yaw_link", "right_elbow_link",
+        "right_wrist_roll_link", "right_wrist_pitch_link", "right_wrist_yaw_link",
+        "left_hand_link_ext", "right_hand_link_ext", "head_link_ext",
+    ])
+    lower_body_names: List[str] = field(default_factory=lambda: [
+        "pelvis",
+        "left_hip_pitch_link", "left_hip_roll_link", "left_hip_yaw_link",
+        "left_knee_link", "left_ankle_pitch_link", "left_ankle_roll_link",
+        "right_hip_pitch_link", "right_hip_roll_link", "right_hip_yaw_link",
+        "right_knee_link", "right_ankle_pitch_link", "right_ankle_roll_link",
+    ])
 
     scale_by_dt: bool = True
 
@@ -117,22 +139,51 @@ SIGMA_FIELDS: Dict[str, str] = {
     "mimic_body_lin_vel_exp":      "body_lin_vel_sigma",
     "mimic_body_ang_vel_exp":      "body_ang_vel_sigma",
     "feet_pos_exp":                "feet_pos_sigma",
+    "mimic_extended_upper_body_pos_exp": "upper_body_pos_sigma",
+    "mimic_extended_lower_body_pos_exp": "lower_body_pos_sigma",
 }
 
 
 @dataclass
 class UpdateSigmaCfg:
-    enabled: bool = False
-    per_motion: bool = True
+    enabled: bool = True
+    # enabled: bool = False
+    per_motion: bool = True     # load per-motion sigmas from ckpt
     alpha: float = 1e-3         # EMA coef
     min_sigma: float = 1e-4
-
-    # per_motion only
     t_warmup: int = 200
-
     terms: Dict[str, Optional[float]] = field(default_factory=lambda: {
-        "mimic_extended_body_pos_exp": 0.3**2,
+        # "mimic_extended_body_pos_exp": 0.3**2,
+        "mimic_extended_upper_body_pos_exp": 0.3**2,
+        "mimic_extended_lower_body_pos_exp": 0.3**2,
     })
+    teacher_ckpt: str = ""
+
+
+@dataclass
+class OdomDelayCfg:
+    enabled: bool = True
+    update_period_steps: List[int] = field(default_factory=lambda: [4, 6])  # 12.5 ~ 8.3 Hz (10 Hz nominal)
+    latency_steps: List[int] = field(default_factory=lambda: [0, 3])        # 0 ~ 60 ms
+
+    # drift
+    drift_enabled: bool = True
+    drift_scale: float = 1.5             # DR
+    drift_xy_dist: float = 0.01          # [m/sqrt(m)]
+    drift_xy_time: float = 0.001         # [m/sqrt(s)]
+    drift_z_dist: float = 0.005          # [m/sqrt(m)]
+    drift_yaw_dist: float = 0.05         # [deg/sqrt(m)]
+    drift_yaw_rot: float = 0.03          # [deg/sqrt(deg)]
+    drift_yaw_time: float = 0.01         # [deg/sqrt(s)]
+    drift_scale_bias_std: float = 0.5    # [%] per episode
+    drift_yaw_bias_std: float = 0.01     # [deg/m] per episode
+
+    max_xy_dev: float = 0.2              # [m]   error bound (est - truth)
+    max_z_dev: float = 0.05              # [m]
+    max_yaw_dev: float = 5.0             # [deg]
+
+    init_xy_dev: float = 0.05            # [m]
+    init_yaw_dev: float = 1.0            # [deg]
 
 
 @dataclass
@@ -153,7 +204,7 @@ class LoRACfg:
 
 @dataclass
 class CriticCfg:
-    source: str = "scratch"             # scratch / teacher
+    source: str = "teacher"             # scratch / teacher
     teacher_ckpt: str = ""
     adapt: str = "lora"                 # teacher critic: lora / fft / frozen
     lora_rank: int = 1
@@ -162,7 +213,7 @@ class CriticCfg:
     hidden_dims: List[int] = field(default_factory=lambda: [512, 256, 128])   # scratch only
     activation: str = "elu"
     lr: float = 1e-3
-    warmup_iters: int = 200             # critic-only iterations before the actor is unfrozen
+    warmup_iters: int = 20             # critic-only iterations before the actor is unfrozen
 
 
 @dataclass
@@ -188,7 +239,7 @@ class TrainCfg:
     max_iterations: int = 3000
     save_interval: int = 500
     log_interval: int = 1
-    device: str = "cpu"
+    device: str = "cuda:0"
     init_noise_std: Optional[float] = 0.2
     std_trainable: bool = False
     std_lr: Optional[float] = 1e-3
@@ -203,6 +254,7 @@ class FinetuneCfg:
     reward: RewardCfg = field(default_factory=RewardCfg)
     update_sigma: UpdateSigmaCfg = field(default_factory=UpdateSigmaCfg)
     termination: TerminationCfg = field(default_factory=TerminationCfg)
+    odom_delay: OdomDelayCfg = field(default_factory=OdomDelayCfg)
     lora: LoRACfg = field(default_factory=LoRACfg)
     critic: CriticCfg = field(default_factory=CriticCfg)
     ppo: PPOCfg = field(default_factory=PPOCfg)
@@ -218,6 +270,8 @@ class FinetuneCfg:
                 setattr(self.paths, name, os.path.expanduser(v))
         if self.critic.teacher_ckpt:
             self.critic.teacher_ckpt = os.path.expanduser(self.critic.teacher_ckpt)
+        if self.update_sigma.teacher_ckpt:
+            self.update_sigma.teacher_ckpt = os.path.expanduser(self.update_sigma.teacher_ckpt)
         if self.train.resume:
             self.train.resume = os.path.expanduser(self.train.resume)
 
@@ -239,8 +293,29 @@ class FinetuneCfg:
         if self.ppo.schedule not in ("adaptive", "fixed"):
             raise ValueError(f"ppo.schedule must be adaptive or fixed, got {self.ppo.schedule!r}")
         self._resolve_update_sigma()
+        self._resolve_odom_delay()
         self.paths.resolve(self.critic.source)
         return self
+
+    def _resolve_odom_delay(self):
+        o = self.odom_delay
+        if not o.enabled:
+            return
+        # gpu backend only: the cpu env (env/mujoco_env.py) ignores it (train.py warns)
+        for name in ("update_period_steps", "latency_steps"):
+            v = getattr(o, name)
+            if len(v) != 2:
+                raise ValueError(f"odom_delay.{name} must be [lo, hi], got {v!r}")
+        (p_lo, p_hi), (l_lo, l_hi) = o.update_period_steps, o.latency_steps
+        if not (1 <= p_lo <= p_hi) or not (0 <= l_lo <= l_hi):
+            raise ValueError(f"invalid odom_delay ranges: update_period_steps={o.update_period_steps}, "
+                             f"latency_steps={o.latency_steps}")
+        if o.drift_enabled:
+            for name in ("drift_scale", "drift_xy_dist", "drift_xy_time", "drift_z_dist", "drift_yaw_dist",
+                         "drift_yaw_rot", "drift_yaw_time", "drift_scale_bias_std", "drift_yaw_bias_std",
+                         "init_xy_dev", "init_yaw_dev"):
+                if float(getattr(o, name)) < 0:
+                    raise ValueError(f"odom_delay.{name} must be >= 0, got {getattr(o, name)!r}")
 
     def _resolve_update_sigma(self):
         """Validate ``update_sigma`` and write each sigma_init into ``reward``."""
@@ -260,6 +335,19 @@ class FinetuneCfg:
             raise ValueError("update_sigma.enabled=True but update_sigma.terms is empty.")
         if u.per_motion and u.t_warmup < 1:
             raise ValueError(f"update_sigma.t_warmup must be >= 1, got {u.t_warmup}.")
+        if u.teacher_ckpt:
+            if not u.per_motion:
+                raise ValueError("update_sigma.teacher_ckpt holds per-motion factors; "
+                                 "it needs update_sigma.per_motion=true.")
+            if not os.path.isfile(u.teacher_ckpt):
+                raise ValueError(f"update_sigma.teacher_ckpt not found: {u.teacher_ckpt}")
+            import torch
+            state = torch.load(u.teacher_ckpt, map_location="cpu", weights_only=False).get("adaptive_sigma")
+            if not state or not state.get("per_motion", False):
+                raise ValueError(
+                    f"{u.teacher_ckpt} has no per-motion 'adaptive_sigma' entry. Train the teacher "
+                    "with SigmaUpdateCfg.enabled=True and per_motion=True.")
+            u.terms = {name: None for name in state["sigma"]}
         for term_name, sigma_init in u.terms.items():
             if term_name not in SIGMA_FIELDS:
                 raise ValueError(

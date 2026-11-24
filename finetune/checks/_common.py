@@ -60,6 +60,9 @@ def cfg_from_args(args, need_motion=True) -> FinetuneCfg:
     if args.critic_spec:
         cfg.paths.critic_spec = args.critic_spec
     apply_overrides(cfg, args.set)
+    # the checks / evaluation never use the critic: without a teacher ckpt fall back to scratch
+    if cfg.critic.source == "teacher" and not cfg.critic.teacher_ckpt:
+        cfg.critic.source = "scratch"
     cfg.update_sigma.enabled = False
     cfg.resolve()
     if need_motion and not cfg.paths.motion_file:

@@ -19,7 +19,7 @@ from typing import Deque, List, Optional
 
 import numpy as np
 
-from obs_terms import ObsContext, StaticContext, get_term
+from obs_terms import ObsContext, StaticContext, get_term, root_offset_from_spec
 from policy_spec import PolicySpec, TermSpec
 
 
@@ -56,6 +56,8 @@ class ObsBuilder:
     def __init__(self, spec: PolicySpec, static: StaticContext):
         self.spec = spec
         self.static = static
+        # obs root frame of this policy (pelvis -> None, imu -> pelvis offset)
+        self.root_offset = root_offset_from_spec(getattr(spec, "root_frame", None))
         self.slots: List[_TermSlot] = []
         offset = 0
         for t in spec.terms:
@@ -71,6 +73,7 @@ class ObsBuilder:
 
     # ----- per tick -----
     def __call__(self, ctx: ObsContext) -> np.ndarray:
+        ctx.root_offset_pos = self.root_offset   # terms compute in this policy's root frame
         parts = []
         for slot in self.slots:
             frame = np.asarray(slot.fn(ctx, slot.spec.params), dtype=np.float32).reshape(-1)
@@ -96,7 +99,8 @@ class ObsBuilder:
         return {s.spec.name: slice(s.offset, s.offset + s.width) for s in self.slots}
 
     def describe(self) -> str:
-        lines = [f"obs layout (term-major, {self.obs_dim} dims):"]
+        root = getattr(self.spec, "root_frame", None)
+        lines = [f"obs layout (term-major, {self.obs_dim} dims; {root.describe() if root else 'root: pelvis'}):"]
         for s in self.slots:
             hist = f"history={s.history} x " if s.history > 1 else ""
             extra = []

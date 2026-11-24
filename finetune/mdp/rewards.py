@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 
 from cfg import g1_29dof_cfg as rcfg   # deploy_real
-from finetune.tasks.ft_cfg import RewardCfg, TerminationCfg
+from finetune.tasks.ft_cfg import SIGMA_FIELDS, RewardCfg, TerminationCfg
 from finetune.helper.math_utils import quat_error_magnitude
 from finetune.motion_data.motion_ref import RefBodyState
 from finetune.env.sim_core import RobotState
@@ -18,6 +18,8 @@ IMPLEMENTED_TERMS = (
     "mimic_body_lin_vel_exp",
     "mimic_body_ang_vel_exp",
     "feet_pos_exp",
+    "mimic_extended_upper_body_pos_exp",
+    "mimic_extended_lower_body_pos_exp",
     "action_rate",
     "joint_pos_limits",
     "undesired_contacts",
@@ -32,9 +34,21 @@ def check_terms(terms: Dict[str, float]) -> Dict[str, float]:
             f"Implemented: {list(IMPLEMENTED_TERMS)}. Add the computation to "
             "finetune/mdp/rewards.py and finetune/mdp/batched_rewards.py first."
         )
-    if not terms:
-        raise ValueError("cfg.reward.terms is empty -- the reward would always be 0")
-    return dict(terms)
+    # weight 0 = off: such a term is neither computed nor logged
+    active = {k: w for k, w in terms.items() if w != 0.0}
+    if not active:
+        raise ValueError("cfg.reward.terms is empty (or all 0) -- the reward would always be 0")
+    return active
+
+
+def extended_body_ids(names: List[str]) -> np.ndarray:
+    """Indices into the extended body list (TRACKED_BODY_NAMES, then EXTENDED_JOINTS), the
+    order of ``RefBodyState.pos`` and ``RobotState.body_pos``."""
+    order = list(rcfg.TRACKED_BODY_NAMES) + [name for name, _, _ in rcfg.EXTENDED_JOINTS]
+    unknown = [n for n in names if n not in order]
+    if unknown:
+        raise ValueError(f"unknown body name(s) {unknown}; known: {order}")
+    return np.array([order.index(n) for n in names], dtype=np.int64)
 
 
 class RewardComputer:
@@ -49,6 +63,8 @@ class RewardComputer:
         # indices into the extended body list (tracked bodies first, same order as RefBodyState)
         self.feet_body_ids = np.array([list(rcfg.TRACKED_BODY_NAMES).index(n)
                                        for n in cfg.feet_body_names], dtype=np.int64)
+        self.upper_body_ids = extended_body_ids(cfg.upper_body_names)
+        self.lower_body_ids = extended_body_ids(cfg.lower_body_names)
         self.weights = check_terms(cfg.terms)
 
     @property
@@ -56,17 +72,12 @@ class RewardComputer:
         return list(self.weights)
 
     def describe(self) -> str:
-        sig = {"root_orientation": self.cfg.root_orientation_sigma,
-               "mimic_extended_body_pos_exp": self.cfg.body_pos_sigma,
-               "mimic_extended_body_ori_exp": self.cfg.body_ori_sigma,
-               "mimic_body_lin_vel_exp": self.cfg.body_lin_vel_sigma,
-               "mimic_body_ang_vel_exp": self.cfg.body_ang_vel_sigma,
-               "feet_pos_exp": self.cfg.feet_pos_sigma}
+        sig = {k: getattr(self.cfg, f) for k, f in SIGMA_FIELDS.items()}
         lines = [f"reward composition ({len(self.weights)} active terms, "
                  f"scale_by_dt={self.cfg.scale_by_dt}, dt={self.dt}):"]
         for k, w in self.weights.items():
             s = sig.get(k)
-            lines.append(f"  {k:30s} w={w:+8.3f}" + (f"   sigma={s:.6g} (={s ** 0.5:.4g})" if s else ""))
+            lines.append(f"  {k:34s} w={w:+8.3f}" + (f"   sigma={s:.6g} (={s ** 0.5:.4g})" if s else ""))
         off = [k for k in IMPLEMENTED_TERMS if k not in self.weights]
         if off:
             lines.append(f"  not in cfg.reward.terms: {', '.join(off)}")
@@ -106,6 +117,17 @@ class RewardComputer:
             # DEX mimic_specific_body_pos_exp: mean over the selected bodies *and* xyz
             feet_err = np.mean(np.square(robot.body_pos[self.feet_body_ids] - ref.pos[self.feet_body_ids]))
             raw["feet_pos_exp"] = float(np.exp(-feet_err / c.feet_pos_sigma))
+
+        # DEX mimic_specific_body_pos_exp with UPPER_BODY_NAMES / LOWER_BODY_NAMES
+        if "mimic_extended_upper_body_pos_exp" in w:
+            ids = self.upper_body_ids
+            up_err = np.mean(np.square(robot.body_pos[ids] - ref.pos[ids]))
+            raw["mimic_extended_upper_body_pos_exp"] = float(np.exp(-up_err / c.upper_body_pos_sigma))
+
+        if "mimic_extended_lower_body_pos_exp" in w:
+            ids = self.lower_body_ids
+            lo_err = np.mean(np.square(robot.body_pos[ids] - ref.pos[ids]))
+            raw["mimic_extended_lower_body_pos_exp"] = float(np.exp(-lo_err / c.lower_body_pos_sigma))
 
         # -- regularisation
         if "action_rate" in w:

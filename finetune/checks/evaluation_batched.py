@@ -23,6 +23,7 @@ from finetune.checks.evaluation import (  # noqa: E402
     Aggregate, load_actor, per_frame_errors, print_metrics, trial_variants,
 )
 from finetune.tasks.ft_cfg import PathsCfg  # noqa: E402
+from finetune.mdp.odom_delay import DRIFT_CFG_KEYS  # noqa: E402
 
 REC_KEYS = ("body_pos", "joint_pos", "root_pos", "root_rot", "root_lin_vel")
 
@@ -80,6 +81,9 @@ def main():
                    help="steps skipped at the start of each trial when accumulating the quality "
                         "metrics (IsaacLab --quality_warmup_steps).")
     p.add_argument("--workers", type=int, default=0, help=argparse.SUPPRESS)   # deprecated, ignored
+    p.add_argument("--odom-delay", choices=("on", "off"), default="on",
+                   help="odometry delay on the actor terms with use_odom_delay (ranges from "
+                        "--set odom_delay.update_period_steps=4,6 odom_delay.latency_steps=0,3)")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--out", default=None)
     args = p.parse_args()
@@ -91,6 +95,7 @@ def main():
     cfg.termination.max_ref_motion_dist = float("inf")
     cfg.env.episode_length_s = 1e4
     cfg.motion.start_time_mode = "zero"
+    cfg.odom_delay.enabled = args.odom_delay == "on"
     if args.max_motions:
         cfg.motion.max_motions = args.max_motions
     if cfg.paths.xml == PathsCfg.xml:
@@ -122,6 +127,7 @@ def main():
     N = env.num_envs
     print(f"[eval] {kind} from {cfg.paths.student_pt}")
     print(f"[eval] actor spec: {cfg.paths.actor_spec}")
+    print(f"[eval] odom delay: {env.odom.describe() if env.odom is not None else 'off'}")
     print(f"[eval] {n_motions} motions x {args.episodes_per_motion} trials on {N} parallel envs "
           f"| fail: body dist > {args.fail_max_dist} m ({args.fail_mode}) | ref-at={args.ref_at}")
 
@@ -254,6 +260,12 @@ def main():
         ("fail_criterion", {"mode": args.fail_mode, "max_dist": args.fail_max_dist}),
         ("start", {"mode": args.start, "settle_time": 0.0}),
         ("ref_at", args.ref_at),
+        ("odom_delay", {"enabled": env.odom is not None,
+                        "update_period_steps": list(cfg.odom_delay.update_period_steps),
+                        "latency_steps": list(cfg.odom_delay.latency_steps),
+                        "drift": bool(env.odom is not None and env.odom.drift),
+                        **({k: getattr(cfg.odom_delay, k) for k in DRIFT_CFG_KEYS}
+                           if env.odom is not None and env.odom.drift else {})}),
         ("quality_metrics", {"enabled": bool(args.quality),
                              "warmup_steps": args.quality_warmup_steps,
                              "jerk_keypoints": quality.keypoint_names} if args.quality

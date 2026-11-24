@@ -64,12 +64,26 @@ class ObsContext:
     ref_root_xy_w: Optional[np.ndarray] = None
     odom_on: bool = False
     anchor_delta_xy: Optional[np.ndarray] = None
+    # Obs root frame offset in the pelvis frame ([3], None = pelvis). Set per policy by
+    # ObsBuilder from spec.root_frame (see root_offset_from_spec), not by the caller.
+    root_offset_pos: Optional[np.ndarray] = None
     _cache: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     # ----- shared sub-computations (cached per tick; several terms share them) -----
     @property
     def robot_root_pos_w(self) -> np.ndarray:
+        """Pelvis (FK / odometry root) position."""
         return np.asarray(self.data.qpos[:3], dtype=np.float64)
+
+    @property
+    def obs_root_pos_w(self) -> np.ndarray:
+        """Position of the policy's obs root frame: pelvis, or pelvis * root_offset_pos (e.g. IMU).
+        Mirrors DEX root_frame_from_parent_pose: X = p_pelvis + R_pelvis @ offset. The obs root
+        orientation equals the pelvis one (rotated root frames are rejected in root_offset_from_spec),
+        so robot_root_quat_w is used unchanged by every term."""
+        if self.root_offset_pos is None:
+            return self.robot_root_pos_w
+        return self.robot_root_pos_w + quat_apply(self.robot_root_quat_w, self.root_offset_pos)
 
     @property
     def robot_root_quat_w(self) -> np.ndarray:
@@ -112,17 +126,43 @@ class ObsContext:
         return self._cache["future_body_pos_w"]
 
     def future_obs(self) -> Tuple[np.ndarray, np.ndarray]:
-        """(future_motion_pos_h [n_fk*B*3], future_motion_anchor [n_fk*6]) for this tick."""
-        if "future_obs" not in self._cache:
+        """(future_motion_pos_h [n_fk*B*3], future_motion_anchor [n_fk*6]) for this tick.
+
+        pos_h is relative to the obs root (pelvis or e.g. IMU); the cache key includes the root
+        offset so builders with different roots can share one context (finetune actor / critic)."""
+        off = None if self.root_offset_pos is None else tuple(float(v) for v in self.root_offset_pos)
+        key = ("future_obs", off)
+        if key not in self._cache:
             _, f_quat, _, _, _ = self.future_frames()
-            pos_h = future_pos_h_from_body_pos(self.future_body_pos_w(), self.robot_root_pos_w, self.robot_root_quat_w)
+            pos_h = future_pos_h_from_body_pos(self.future_body_pos_w(), self.obs_root_pos_w, self.robot_root_quat_w)
             anchor = compute_future_motion_anchor(f_quat[:self.n_fk], self.robot_root_quat_w)
-            self._cache["future_obs"] = (pos_h, anchor)
-        return self._cache["future_obs"]
+            self._cache[key] = (pos_h, anchor)
+        return self._cache[key]
 
     def _require_ref(self):
         if self.ref_data is None:
             raise RuntimeError("diff_body_* terms need ref_data (spec.needs_ref_fk).")
+
+
+def root_offset_from_spec(root_frame) -> Optional[np.ndarray]:
+    """policy_spec.RootFrameSpec -> ObsContext.root_offset_pos ([3] in the pelvis frame, None = pelvis).
+
+    Root-dependent terms and how a pelvis-attached root X = pelvis * (pos, quat=identity) enters:
+      * future_motion_pos_h       : relative to X's position          -> uses obs_root_pos_w
+      * diff_body_pos_b, anchor,
+        base_ang_vel/roll_pitch,
+        future_motion_root_*_b/pb : only X's orientation (= pelvis)   -> unchanged
+    A rotated root frame would change all of the above and is not supported here.
+    """
+    if root_frame is None or root_frame.is_pelvis:
+        return None
+    if root_frame.parent_body != "pelvis":
+        raise NotImplementedError(f"obs root frame must be attached to the pelvis, got '{root_frame.parent_body}'")
+    if not np.allclose(root_frame.quat, (1.0, 0.0, 0.0, 0.0), atol=1e-6):
+        raise NotImplementedError(
+            f"obs root frame '{root_frame.name}' is rotated w.r.t. the pelvis (quat={list(root_frame.quat)}); "
+            f"only translated root frames (e.g. imu_in_pelvis) are supported by the deploy obs terms.")
+    return np.asarray(root_frame.pos, dtype=np.float64)
 
 
 # --------------------------------------------------------------------------- registry

@@ -1,6 +1,7 @@
 """Per-policy observation spec."""
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -27,6 +28,63 @@ class TermSpec:
         return int(default if n is None else n)
 
 
+PELVIS = "pelvis"
+
+
+@dataclass
+class RootFrameSpec:
+    """Frame the policy's root-dependent obs were trained in (export_deploy_cfg ``root`` / ``root_frame``).
+
+    The FK / odometry root on the deploy side is always the pelvis; a non-pelvis root is a frame
+    rigidly attached to it: ``X = pelvis * (pos, quat)``. Runs exported before this field existed
+    have neither key and are pelvis-rooted.
+    """
+    name: str = PELVIS
+    parent_body: str = PELVIS
+    pos: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    quat: Tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)   # wxyz, w.r.t. the parent body
+
+    @property
+    def is_pelvis(self) -> bool:
+        """True if the frame coincides with the pelvis (no offset needed)."""
+        return (self.parent_body == PELVIS and all(v == 0.0 for v in self.pos)
+                and tuple(self.quat) == (1.0, 0.0, 0.0, 0.0))
+
+    def describe(self) -> str:
+        if self.is_pelvis:
+            return f"root: {self.name}"
+        return f"root: {self.name} = {self.parent_body} * (pos={list(self.pos)}, quat={list(self.quat)})"
+
+
+def parse_root_frame(data: dict, path: Optional[str] = None) -> RootFrameSpec:
+    """Read ``root`` / ``root_frame`` of a spec. Missing -> pelvis (older exports)."""
+    where = f"policy spec {path or ''}"
+    name = str(data.get("root") or PELVIS)
+    raw = data.get("root_frame")
+    if raw is None:
+        if name != PELVIS:
+            raise ValueError(f"{where}: root '{name}' has no 'root_frame' (re-export with export_deploy_cfg.py)")
+        return RootFrameSpec()
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where}: 'root_frame' must be a dict, got {raw!r}")
+
+    parent = str(raw.get("parent_body") or PELVIS)
+    if parent != PELVIS:
+        # the deploy FK root (odometry / IMU chain) is the pelvis
+        raise ValueError(f"{where}: root_frame.parent_body must be '{PELVIS}', got '{parent}'")
+    pos = raw.get("pos") or [0.0, 0.0, 0.0]
+    quat = raw.get("quat") or [1.0, 0.0, 0.0, 0.0]
+    if len(pos) != 3 or len(quat) != 4:
+        raise ValueError(f"{where}: root_frame needs pos[3] and quat[4] (wxyz), got pos={pos} quat={quat}")
+    pos = tuple(float(v) for v in pos)
+    quat = tuple(float(v) for v in quat)
+    norm = math.sqrt(sum(v * v for v in quat))
+    if abs(norm - 1.0) > 1e-3:
+        raise ValueError(f"{where}: root_frame.quat {list(quat)} is not unit length (|q|={norm:.4f})")
+    quat = tuple(v / norm for v in quat)
+    return RootFrameSpec(name=name, parent_body=parent, pos=pos, quat=quat)
+
+
 @dataclass
 class PolicySpec:
     terms: List[TermSpec]
@@ -35,6 +93,7 @@ class PolicySpec:
     obs_dim: Optional[int] = None
     path: Optional[str] = None
     source_run: Optional[str] = None
+    root_frame: RootFrameSpec = field(default_factory=RootFrameSpec)
 
     # ----- derived -----
     @property
@@ -80,6 +139,7 @@ class PolicySpec:
             lines.append(f"  source_run: {self.source_run}")
         lines.append(f"  future_steps={self.future_steps} interval={self.future_interval} obs_dim={self.obs_dim}")
         lines.append(f"  {self.describe_future()}")
+        lines.append(f"  {self.root_frame.describe()}")
         for t in self.terms:
             extra = []
             if t.history_len > 1:
@@ -118,6 +178,7 @@ def parse_spec(data: dict, path: Optional[str] = None) -> PolicySpec:
         obs_dim=None if data.get("obs_dim") is None else int(data["obs_dim"]),
         path=path,
         source_run=data.get("source_run"),
+        root_frame=parse_root_frame(data, path),
     )
 
 

@@ -90,9 +90,13 @@ def _planar_base_inv(c: BatchedObsContext) -> torch.Tensor:
 @bterm("diff_body_pos_b")
 def diff_body_pos_b(c, p):
     """(ref - robot) extended-body positions in the robot base frame, from the mimic frame.
-    The training env runs with odom on, so root translation is *not* cancelled."""
-    diff_w = _mimic_ref_body_pose(c)[0] - c.robot.body_pos
-    return _flat(_rot_rows(quat_conj(c.robot.root_quat), diff_w))
+    The training env runs with odom on, so root translation is *not* cancelled.
+    ``use_odom_delay``: robot bodies = FK(delayed odometry pelvis, current joints), rotated by the
+    estimated pelvis quat (DEX_RL_LAB diff_body_pos_b)."""
+    odom = c.use_odom(p)
+    _, base_quat = c.root_pose(odom)
+    diff_w = _mimic_ref_body_pose(c)[0] - c.robot_body_pos(odom)
+    return _flat(_rot_rows(quat_conj(base_quat), diff_w))
 
 
 @bterm("diff_body_pos_b_deploy")
@@ -151,8 +155,9 @@ def _future_body_pos_w(c: BatchedObsContext) -> torch.Tensor:
 def future_motion_pos_h(c, p):
     n = future_num_steps(c.static, p)
     body = _future_body_pos_w(c)[:, :n]                     # [N, n, B, 3]
-    rel = body - c.robot.root_pos[:, None, None, :]
-    h_inv = _heading_inv(c)[:, None, None, :].expand(*rel.shape[:-1], 4)
+    root_pos, root_quat = c.obs_root_pose(c.use_odom(p))    # obs root: pelvis or e.g. IMU (true / odom)
+    rel = body - root_pos[:, None, None, :]
+    h_inv = heading_quat_from_quat(root_quat, inverse=True)[:, None, None, :].expand(*rel.shape[:-1], 4)
     return _flat(quat_apply(h_inv, rel))
 
 
@@ -160,8 +165,9 @@ def future_motion_pos_h(c, p):
 def future_motion_anchor(c, p):
     n = future_num_steps(c.static, p)
     f_quat = _future_frames(c)[1][:, :n]                     # [N, n, 4]
-    base = c.robot.root_quat[:, None, :].expand_as(f_quat)
-    planar = heading_quat_from_quat(c.robot.root_quat)[:, None, :].expand_as(f_quat)
+    _, root_quat = c.root_pose(c.use_odom(p))                # true / estimated (odom) pelvis quat
+    base = root_quat[:, None, :].expand_as(f_quat)
+    planar = heading_quat_from_quat(root_quat)[:, None, :].expand_as(f_quat)
     rel_w = quat_mul(f_quat, quat_conj(base))
     rel_hc = quat_mul(quat_mul(quat_conj(planar), rel_w), planar)
     return _flat(quat_to_rot6d(rel_hc))

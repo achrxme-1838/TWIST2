@@ -8,7 +8,7 @@ import torch
 from cfg import g1_29dof_cfg as rcfg   # deploy_real
 from finetune.helper.torch_math import quat_error_magnitude
 from finetune.mdp.adaptive_sigma import AdaptiveSigma
-from finetune.mdp.rewards import RewardComputer, check_terms
+from finetune.mdp.rewards import RewardComputer, check_terms, extended_body_ids
 from finetune.motion_data.batched_motion_ref import BatchedRefBodyState
 from finetune.tasks.ft_cfg import SIGMA_FIELDS, RewardCfg, TerminationCfg, UpdateSigmaCfg
 
@@ -29,6 +29,8 @@ class BatchedRewardComputer:
         self.feet_body_ids = torch.as_tensor(
             np.array([list(rcfg.TRACKED_BODY_NAMES).index(n) for n in cfg.feet_body_names],
                      dtype=np.int64), device=device)
+        self.upper_body_ids = torch.as_tensor(extended_body_ids(cfg.upper_body_names), device=device)
+        self.lower_body_ids = torch.as_tensor(extended_body_ids(cfg.lower_body_names), device=device)
         self.weights = check_terms(cfg.terms)
 
         # -- PBHC adaptive tracking factor; None keeps the fixed RewardCfg sigmas.
@@ -37,6 +39,8 @@ class BatchedRewardComputer:
             sigma_init = {k: getattr(cfg, SIGMA_FIELDS[k]) for k in update_sigma.terms}
             self.adaptive_sigma = AdaptiveSigma(update_sigma, sigma_init, num_motions, num_envs,
                                                 device, motion_names)
+            if update_sigma.teacher_ckpt:
+                self.adaptive_sigma.load_teacher(update_sigma.teacher_ckpt)
 
     @property
     def term_names(self):
@@ -95,6 +99,17 @@ class BatchedRewardComputer:
             # DEX mimic_specific_body_pos_exp: mean over the selected bodies *and* xyz
             ids = self.feet_body_ids
             err["feet_pos_exp"] = (robot.body_pos[:, ids] - ref.pos[:, ids]).pow(2).flatten(1).mean(dim=1)
+
+        # DEX mimic_specific_body_pos_exp with UPPER_BODY_NAMES / LOWER_BODY_NAMES
+        if "mimic_extended_upper_body_pos_exp" in w:
+            ids = self.upper_body_ids
+            err["mimic_extended_upper_body_pos_exp"] = (
+                robot.body_pos[:, ids] - ref.pos[:, ids]).pow(2).flatten(1).mean(dim=1)
+
+        if "mimic_extended_lower_body_pos_exp" in w:
+            ids = self.lower_body_ids
+            err["mimic_extended_lower_body_pos_exp"] = (
+                robot.body_pos[:, ids] - ref.pos[:, ids]).pow(2).flatten(1).mean(dim=1)
 
         for k, x in err.items():
             raw[k] = torch.exp(-x / sig[k])

@@ -5,6 +5,7 @@ Port of DEX_RL_LAB_PHUMA ``dex_rl_lab/manager_wrapper/adaptive_sigma.py``.
 
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Optional, Union
 
 import torch
@@ -38,6 +39,8 @@ class AdaptiveSigma:
         self._num_motions = int(num_motions)
         self._motion_names = list(motion_names) if motion_names is not None else None
         self._device = device
+        # True after load_teacher(): the factors stay fixed, only the error EMA is tracked.
+        self._frozen = False
 
         if not self._per_motion:
             # 0-dim tensors: they broadcast against the [N] error exactly as the float did.
@@ -74,12 +77,23 @@ class AdaptiveSigma:
     def per_motion(self) -> bool:
         return self._per_motion
 
+    @property
+    def frozen(self) -> bool:
+        return self._frozen
+
     def describe(self) -> str:
         scope = f"per motion (t_warmup={self._t_warmup})" if self._per_motion else "shared across motions"
+        if self._frozen:
+            lines = [f"adaptive sigma: {scope}, FROZEN (teacher per-motion factors, no update)"]
+            for name in self._term_names:
+                v = self._sigma[name]
+                lines.append(f"  {name:34s} sigma mean={float(v.mean()):.6g} "
+                             f"min={float(v.amin()):.6g} max={float(v.amax()):.6g}")
+            return "\n".join(lines)
         lines = [f"adaptive sigma: {scope}, alpha={self._alpha:g}, min_sigma={self._min_sigma:g}"]
         for name in self._term_names:
             s = float(self._sigma[name].flatten()[0])
-            lines.append(f"  {name:30s} sigma_init={s:.6g}")
+            lines.append(f"  {name:34s} sigma_init={s:.6g}")
         return "\n".join(lines)
 
     def begin_step(self, mid: torch.Tensor):
@@ -142,6 +156,8 @@ class AdaptiveSigma:
 
         visits = self._visits[visited]
         error_ema = acc[visited] / (1.0 - (1.0 - alpha) ** visits.to(acc.dtype))
+        if self._frozen:
+            return
 
         warm = visits >= self._t_warmup
         ready = visited[warm]
@@ -202,10 +218,89 @@ class AdaptiveSigma:
         extras["Sigma/motions_warm"] = flat[-1]
         return extras
 
+    # ------------------------------------------------------------------ teacher sigma
+    def load_teacher(self, path: str):
+        """Load the converged per-motion factors of a DEX_RL_LAB teacher checkpoint and freeze them.
+
+        The teacher saves them under ``"adaptive_sigma"`` when trained with
+        ``SigmaUpdateCfg.per_motion=True``. Motions are matched by name (the motion pkl key), so
+        the fine-tuning motion set may be a subset or another order of the teacher's. A motion
+        the teacher did not have keeps the ``update_sigma.terms`` value. After this call
+        ``update()`` only tracks the error EMA and never changes the factors.
+        """
+        if not self._per_motion:
+            raise ValueError("load_teacher needs update_sigma.per_motion=true")
+        if self._motion_names is None:
+            raise ValueError("load_teacher needs the motion names to match the teacher's motions")
+        ck = torch.load(path, map_location="cpu", weights_only=False)
+        state = ck.get("adaptive_sigma") if isinstance(ck, dict) else None
+        if state is None:
+            raise ValueError(
+                f"{path} has no 'adaptive_sigma' entry. The teacher must be trained with "
+                "SigmaUpdateCfg.enabled=True and per_motion=True (checkpoints saved before the "
+                "sigma saving was added do not have it).")
+        if not state.get("per_motion", False):
+            raise ValueError(f"{path}: the teacher's adaptive sigma is not per motion")
+        missing = [t for t in self._term_names if t not in state["sigma"]]
+        if missing:
+            raise ValueError(
+                f"update_sigma.terms {missing} are not in the teacher sigma state "
+                f"(teacher terms: {list(state['sigma'])}). Use the teacher's term names, e.g. "
+                "mimic_extended_upper_body_pos_exp / mimic_extended_lower_body_pos_exp.")
+
+        # exact key first; directory-mode teacher keys are file paths, so also try the file stem
+        keys = [str(k) for k in state["motion_keys"]]
+        exact: Dict[str, int] = {}
+        for i, k in enumerate(keys):
+            exact.setdefault(k, i)
+        stem_count: Dict[str, int] = {}
+        stem_idx: Dict[str, int] = {}
+        for i, k in enumerate(keys):
+            stem = os.path.splitext(os.path.basename(k))[0]
+            stem_count[stem] = stem_count.get(stem, 0) + 1
+            stem_idx.setdefault(stem, i)
+        src = []
+        for name in self._motion_names:
+            i = exact.get(name)
+            if i is None and stem_count.get(name) == 1:
+                i = stem_idx[name]
+            src.append(-1 if i is None else i)
+        src_t = torch.tensor(src, dtype=torch.long)
+        found = torch.nonzero(src_t >= 0, as_tuple=True)[0]
+        absent = [self._motion_names[j] for j in torch.nonzero(src_t < 0, as_tuple=True)[0].tolist()]
+        if found.numel() == 0:
+            raise ValueError(f"no fine-tuning motion matches a teacher motion key "
+                             f"(teacher keys e.g. {keys[:3]}, ours e.g. {self._motion_names[:3]})")
+
+        src_found = src_t[found]
+        dst = found.to(self._device)
+        for t in self._term_names:
+            teacher_sigma = state["sigma"][t].to(torch.float32)
+            self._sigma[t][dst] = teacher_sigma[src_found].to(self._device)
+        self._frozen = True
+
+        t_warmup = int(state.get("t_warmup", 1))
+        visits = state.get("visits")
+        cold = int((visits[src_found] < t_warmup).sum()) if visits is not None else 0
+        print(f"[sigma] loaded teacher per-motion sigma from {path}")
+        print(f"[sigma]   matched {found.numel()}/{self._num_motions} motions by name "
+              f"(teacher has {len(keys)}); frozen, no update during fine-tuning")
+        if cold:
+            print(f"[sigma]   WARNING: {cold} matched motion(s) had < {t_warmup} teacher visits, "
+                  "so their teacher factor is still its sigma_init")
+        if absent:
+            print(f"[sigma]   WARNING: {len(absent)} motion(s) not in the teacher, kept "
+                  f"update_sigma.terms value: {absent[:5]}{' ...' if len(absent) > 5 else ''}")
+        for t in self._term_names:
+            v = self._sigma[t][dst]
+            print(f"[sigma]   {t:34s} mean={float(v.mean()):.6g} min={float(v.amin()):.6g} "
+                  f"max={float(v.amax()):.6g}")
+
     # ------------------------------------------------------------------ checkpoint
     def state_dict(self) -> dict:
         state = {
             "per_motion": self._per_motion,
+            "frozen": self._frozen,
             "num_motions": self._num_motions,
             "motion_names": self._motion_names,
             "sigma": {k: v.detach().cpu().clone() for k, v in self._sigma.items()},
