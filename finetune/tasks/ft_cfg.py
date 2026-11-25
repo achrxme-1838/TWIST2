@@ -186,8 +186,20 @@ class OdomDelayCfg:
     init_yaw_dev: float = 1.0            # [deg]
 
 
-# @dataclass
-# class ImuErrorCfg:
+@dataclass
+class ImuErrorCfg:
+    """IMU / AHRS error on the actor terms with ``use_imu_error``."""
+    enabled: bool = True
+    scale_range: List[float] = field(default_factory=lambda: [0.5, 1.5])     # DR range
+    gyro_noise: float = 0.003                        # [rad/s]      wn
+    gyro_bias: float = 0.002                         # [rad/s]
+    gyro_bias_rw: float = 2e-5                       # [rad/s/sqrt(s)]  random walk
+    ahrs_tau_range: List[float] = field(default_factory=lambda: [0.5, 2.0])  # [s]
+    accel_tilt: float = 1.0                          # [-]
+    misalign_deg: float = 0.3                        # [deg]
+    imu_rate: float = 500.0                          # [Hz]
+    init_err_deg: float = 1.0                        # [deg]
+    max_err_deg: float = 10.0                        # [deg]
 
 
 @dataclass
@@ -259,7 +271,8 @@ class FinetuneCfg:
     update_sigma: UpdateSigmaCfg = field(default_factory=UpdateSigmaCfg)
     termination: TerminationCfg = field(default_factory=TerminationCfg)
     odom_delay: OdomDelayCfg = field(default_factory=OdomDelayCfg)
-    lora: LoRACfg = field(default_factory=LoRACfg)
+    imu_error: ImuErrorCfg = field(default_factory=ImuErrorCfg)
+    lora:LoRACfg = field(default_factory=LoRACfg)
     critic: CriticCfg = field(default_factory=CriticCfg)
     ppo: PPOCfg = field(default_factory=PPOCfg)
     train: TrainCfg = field(default_factory=TrainCfg)
@@ -298,8 +311,27 @@ class FinetuneCfg:
             raise ValueError(f"ppo.schedule must be adaptive or fixed, got {self.ppo.schedule!r}")
         self._resolve_update_sigma()
         self._resolve_odom_delay()
+        self._resolve_imu_error()
         self.paths.resolve(self.critic.source)
         return self
+
+    def _resolve_imu_error(self):
+        e = self.imu_error
+        if not e.enabled:
+            return
+        # gpu backend only: the cpu env (env/mujoco_env.py) ignores it (train.py warns)
+        for name in ("scale_range", "ahrs_tau_range"):
+            v = getattr(e, name)
+            if len(v) != 2 or float(v[0]) > float(v[1]) or float(v[0]) < 0:
+                raise ValueError(f"imu_error.{name} must be [lo, hi] with 0 <= lo <= hi, got {v!r}")
+        if float(e.ahrs_tau_range[0]) <= 0:
+            raise ValueError(f"imu_error.ahrs_tau_range must be > 0, got {e.ahrs_tau_range!r}")
+        if float(e.imu_rate) <= 0:
+            raise ValueError(f"imu_error.imu_rate must be > 0, got {e.imu_rate!r}")
+        for name in ("gyro_noise", "gyro_bias", "gyro_bias_rw", "accel_tilt", "misalign_deg",
+                     "init_err_deg", "max_err_deg"):
+            if float(getattr(e, name)) < 0:
+                raise ValueError(f"imu_error.{name} must be >= 0, got {getattr(e, name)!r}")
 
     def _resolve_odom_delay(self):
         o = self.odom_delay

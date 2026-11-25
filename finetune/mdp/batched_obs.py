@@ -40,6 +40,9 @@ class BatchedObsContext:
     # Estimated (odometry-delayed) pelvis pose (pos [N, 3], quat wxyz [N, 4]) from OdomDelayBuffer,
     # None when odom delay is off. Read only by terms with ``use_odom_delay: true`` (actor spec).
     est_pelvis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # IMU / AHRS error (ImuErrorBuffer), None when off. Read only by terms with ``use_imu_error: true``.
+    imu_quat: Optional[torch.Tensor] = None   # [N, 4] wxyz AHRS pelvis orientation (roll / pitch used)
+    gyro_err: Optional[torch.Tensor] = None   # [N, 3] additive gyro error (body frame)
     _cache: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     @property
@@ -52,38 +55,70 @@ class BatchedObsContext:
         q = self.robot.root_quat
         return self.robot.root_pos + quat_apply(q, self.root_offset_pos.to(q.dtype).expand(q.shape[0], 3))
 
-    # ----- odometry delay (DEX_RL_LAB odom_delay.obs_root_pose_w / reattach_body_pos_w) -----
+    # ----- odometry delay / IMU error (DEX_RL_LAB odom_delay.obs_root_pose_w / reattach_body_pos_w) -----
     def use_odom(self, params: dict) -> bool:
         """True when the term asks for the delayed odometry and the env provides it."""
         return bool(params.get("use_odom_delay", False)) and self.est_pelvis is not None
 
-    def root_pose(self, odom: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Pelvis (pos [N, 3], quat wxyz [N, 4]): true, or the estimated odometry pose."""
-        if odom and self.est_pelvis is not None:
-            return self.est_pelvis
-        return self.robot.root_pos, self.robot.root_quat
+    def use_imu(self, params: dict) -> bool:
+        """True when the term asks for the IMU error and the env provides it."""
+        return bool(params.get("use_imu_error", False)) and self.imu_quat is not None
 
-    def obs_root_pose(self, odom: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def imu_rpy(self) -> torch.Tensor:
+        """[N, 3] rpy of the AHRS pelvis orientation (only roll / pitch are meaningful)."""
+        if "imu_rpy" not in self._cache:
+            from finetune.helper.torch_math import quat_to_rpy
+            self._cache["imu_rpy"] = quat_to_rpy(self.imu_quat)
+        return self._cache["imu_rpy"]
+
+    def est_root(self, params: dict) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Estimated pelvis pose (pos [N, 3], quat wxyz [N, 4]) for a term, None = true pose.
+            xyz / yaw   : odometry (use_odom_delay) or true
+            roll / pitch: AHRS estimate (use_imu_error) or true"""
+        odom, imu = self.use_odom(params), self.use_imu(params)
+        if not imu:
+            return self.est_pelvis if odom else None
+        key = f"est_root_{int(odom)}"
+        if key not in self._cache:
+            from finetune.helper.torch_math import quat_to_rpy, rpy_to_quat
+            if odom:
+                pos = self.est_pelvis[0]
+                yaw = quat_to_rpy(self.est_pelvis[1])[:, 2]
+            else:
+                pos, yaw = self.robot.root_pos, self.rpy[:, 2]
+            rp = self.imu_rpy()[:, :2].to(yaw.dtype)
+            self._cache[key] = (pos, rpy_to_quat(torch.cat((rp, yaw[:, None]), dim=-1)))
+        return self._cache[key]
+
+    def root_pose(self, params: dict) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pelvis (pos [N, 3], quat wxyz [N, 4]): true, or the estimated (odom / IMU) pose."""
+        est = self.est_root(params)
+        return est if est is not None else (self.robot.root_pos, self.robot.root_quat)
+
+    def obs_root_pose(self, params: dict) -> Tuple[torch.Tensor, torch.Tensor]:
         """Obs root frame (pelvis or e.g. IMU) attached to the true / estimated pelvis pose.
         Its orientation equals the pelvis one (rotated root frames are rejected)."""
-        if not odom or self.est_pelvis is None:
+        est = self.est_root(params)
+        if est is None:
             return self.obs_root_pos, self.robot.root_quat
-        pos, quat = self.est_pelvis
+        pos, quat = est
         if self.root_offset_pos is None:
             return pos, quat
         from finetune.helper.torch_math import quat_apply
         return pos + quat_apply(quat, self.root_offset_pos.to(quat.dtype).expand(quat.shape[0], 3)), quat
 
-    def robot_body_pos(self, odom: bool = False) -> torch.Tensor:
-        """[N, B_ext, 3] robot body positions; with odom = FK(estimated pelvis, current joints)."""
-        if not odom or self.est_pelvis is None:
+    def robot_body_pos(self, params: dict) -> torch.Tensor:
+        """[N, B_ext, 3] robot body positions; estimated = FK(estimated pelvis, current joints)."""
+        est = self.est_root(params)
+        if est is None:
             return self.robot.body_pos
-        if "odom_body_pos" not in self._cache:
+        key = f"est_body_pos_{int(self.use_odom(params))}{int(self.use_imu(params))}"
+        if key not in self._cache:
             from finetune.mdp.odom_delay import reattach_body_pos
-            est_pos, est_quat = self.est_pelvis
-            self._cache["odom_body_pos"] = reattach_body_pos(
+            est_pos, est_quat = est
+            self._cache[key] = reattach_body_pos(
                 self.robot.body_pos, self.robot.root_pos, self.robot.root_quat, est_pos, est_quat)
-        return self._cache["odom_body_pos"]
+        return self._cache[key]
 
     @property
     def n_fk(self) -> int:

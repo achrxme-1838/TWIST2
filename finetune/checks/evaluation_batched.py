@@ -24,6 +24,7 @@ from finetune.checks.evaluation import (  # noqa: E402
 )
 from finetune.tasks.ft_cfg import PathsCfg  # noqa: E402
 from finetune.mdp.odom_delay import DRIFT_CFG_KEYS  # noqa: E402
+from finetune.mdp.imu_error import IMU_ERROR_CFG_KEYS  # noqa: E402
 
 REC_KEYS = ("body_pos", "joint_pos", "root_pos", "root_rot", "root_lin_vel")
 
@@ -84,6 +85,9 @@ def main():
     p.add_argument("--odom-delay", choices=("on", "off"), default="on",
                    help="odometry delay on the actor terms with use_odom_delay (ranges from "
                         "--set odom_delay.update_period_steps=4,6 odom_delay.latency_steps=0,3)")
+    p.add_argument("--imu-error", choices=("on", "off"), default="on",
+                   help="IMU / AHRS error on the actor terms with use_imu_error (settings from "
+                        "--set imu_error.gyro_bias=... etc.)")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--out", default=None)
     args = p.parse_args()
@@ -96,6 +100,7 @@ def main():
     cfg.env.episode_length_s = 1e4
     cfg.motion.start_time_mode = "zero"
     cfg.odom_delay.enabled = args.odom_delay == "on"
+    cfg.imu_error.enabled = args.imu_error == "on"
     if args.max_motions:
         cfg.motion.max_motions = args.max_motions
     if cfg.paths.xml == PathsCfg.xml:
@@ -128,6 +133,7 @@ def main():
     print(f"[eval] {kind} from {cfg.paths.student_pt}")
     print(f"[eval] actor spec: {cfg.paths.actor_spec}")
     print(f"[eval] odom delay: {env.odom.describe() if env.odom is not None else 'off'}")
+    print(f"[eval] imu error: {env.imu.describe() if env.imu is not None else 'off'}")
     print(f"[eval] {n_motions} motions x {args.episodes_per_motion} trials on {N} parallel envs "
           f"| fail: body dist > {args.fail_max_dist} m ({args.fail_mode}) | ref-at={args.ref_at}")
 
@@ -266,6 +272,9 @@ def main():
                         "drift": bool(env.odom is not None and env.odom.drift),
                         **({k: getattr(cfg.odom_delay, k) for k in DRIFT_CFG_KEYS}
                            if env.odom is not None and env.odom.drift else {})}),
+        ("imu_error", {"enabled": env.imu is not None,
+                       **({k: getattr(cfg.imu_error, k) for k in IMU_ERROR_CFG_KEYS}
+                          if env.imu is not None else {})}),
         ("quality_metrics", {"enabled": bool(args.quality),
                              "warmup_steps": args.quality_warmup_steps,
                              "jerk_keypoints": quality.keypoint_names} if args.quality

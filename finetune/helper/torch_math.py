@@ -135,3 +135,12 @@ def yaw_quat(yaw: torch.Tensor, inverse: bool = False) -> torch.Tensor:
     half = -0.5 * yaw if inverse else 0.5 * yaw
     zero = torch.zeros_like(half)
     return torch.stack([torch.cos(half), zero, zero, torch.sin(half)], dim=-1)
+
+
+def quat_from_rotvec(rv: torch.Tensor) -> torch.Tensor:
+    """Rotation vector (axis * angle) [..., 3] -> wxyz quat [..., 4] (IsaacLab quat_from_axis_angle)."""
+    angle = rv.norm(dim=-1, keepdim=True)
+    half = 0.5 * angle
+    small = angle < 1e-6
+    k = torch.where(small, 0.5 - angle * angle / 48.0, torch.sin(half) / angle.clamp_min(1e-6))
+    return torch.cat([torch.cos(half), rv * k], dim=-1)

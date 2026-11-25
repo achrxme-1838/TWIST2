@@ -135,6 +135,8 @@ def main():
         from finetune.env.mujoco_env import G1MimicVecEnv as MimicVecEnv
         if cfg.odom_delay.enabled:
             print("[WARN] odom_delay is implemented for env.backend=gpu only; the cpu env ignores it.")
+        if cfg.imu_error.enabled:
+            print("[WARN] imu_error is implemented for env.backend=gpu only; the cpu env ignores it.")
     from finetune.mdp.policy import LoRAActorCritic, load_student_state, load_teacher_critic_state
     from rsl_rl.algorithms import PPO
 

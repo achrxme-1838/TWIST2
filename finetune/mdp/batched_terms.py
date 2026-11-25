@@ -31,11 +31,17 @@ def _planar_inv(c: BatchedObsContext) -> torch.Tensor:
 # --------------------------------------------------------------------------- proprio
 @bterm("base_ang_vel")
 def base_ang_vel(c, p):
+    """``use_imu_error``: + gyro bias / white noise of the IMU error model."""
+    if c.use_imu(p):
+        return c.ang_vel + c.gyro_err.to(c.ang_vel.dtype)
     return c.ang_vel
 
 
 @bterm("base_roll_pitch")
 def base_roll_pitch(c, p):
+    """``use_imu_error``: roll / pitch of the AHRS orientation of the IMU error model."""
+    if c.use_imu(p):
+        return c.imu_rpy()[:, :2].to(c.rpy.dtype)
     return c.rpy[:, :2]
 
 
@@ -91,11 +97,10 @@ def _planar_base_inv(c: BatchedObsContext) -> torch.Tensor:
 def diff_body_pos_b(c, p):
     """(ref - robot) extended-body positions in the robot base frame, from the mimic frame.
     The training env runs with odom on, so root translation is *not* cancelled.
-    ``use_odom_delay``: robot bodies = FK(delayed odometry pelvis, current joints), rotated by the
-    estimated pelvis quat (DEX_RL_LAB diff_body_pos_b)."""
-    odom = c.use_odom(p)
-    _, base_quat = c.root_pose(odom)
-    diff_w = _mimic_ref_body_pose(c)[0] - c.robot_body_pos(odom)
+    ``use_odom_delay`` / ``use_imu_error``: robot bodies = FK(estimated pelvis, current joints), rotated
+    by the estimated pelvis quat (DEX_RL_LAB diff_body_pos_b)."""
+    _, base_quat = c.root_pose(p)
+    diff_w = _mimic_ref_body_pose(c)[0] - c.robot_body_pos(p)
     return _flat(_rot_rows(quat_conj(base_quat), diff_w))
 
 
@@ -155,7 +160,7 @@ def _future_body_pos_w(c: BatchedObsContext) -> torch.Tensor:
 def future_motion_pos_h(c, p):
     n = future_num_steps(c.static, p)
     body = _future_body_pos_w(c)[:, :n]                     # [N, n, B, 3]
-    root_pos, root_quat = c.obs_root_pose(c.use_odom(p))    # obs root: pelvis or e.g. IMU (true / odom)
+    root_pos, root_quat = c.obs_root_pose(p)                # obs root: pelvis or e.g. IMU (true / odom / imu)
     rel = body - root_pos[:, None, None, :]
     h_inv = heading_quat_from_quat(root_quat, inverse=True)[:, None, None, :].expand(*rel.shape[:-1], 4)
     return _flat(quat_apply(h_inv, rel))
@@ -165,7 +170,7 @@ def future_motion_pos_h(c, p):
 def future_motion_anchor(c, p):
     n = future_num_steps(c.static, p)
     f_quat = _future_frames(c)[1][:, :n]                     # [N, n, 4]
-    _, root_quat = c.root_pose(c.use_odom(p))                # true / estimated (odom) pelvis quat
+    _, root_quat = c.root_pose(p)                            # true / estimated (odom / imu) pelvis quat
     base = root_quat[:, None, :].expand_as(f_quat)
     planar = heading_quat_from_quat(root_quat)[:, None, :].expand_as(f_quat)
     rel_w = quat_mul(f_quat, quat_conj(base))
@@ -298,6 +303,9 @@ def priv_motion_phase(c, p):
 # --------------------------------------------------------------------------- teacher critic terms
 @bterm("projected_gravity")
 def projected_gravity(c, p):
+    """``use_imu_error``: projected on the AHRS orientation of the IMU error model."""
+    if c.use_imu(p):
+        return projected_gravity_b(c.imu_quat).to(c.robot.root_quat.dtype)
     return projected_gravity_b(c.robot.root_quat)
 
 

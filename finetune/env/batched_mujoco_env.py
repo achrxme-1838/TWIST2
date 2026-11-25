@@ -12,6 +12,7 @@ from finetune.env.batched_core import BatchedG1SimCore
 from finetune.helper.torch_math import quat_to_rpy, xyzw_to_wxyz
 from finetune.mdp.batched_obs import BatchedObsBuilder, BatchedObsContext
 from finetune.mdp.odom_delay import OdomDelayBuffer, drift_kwargs
+from finetune.mdp.imu_error import ImuErrorBuffer, imu_error_kwargs
 from finetune.mdp.batched_rewards import BatchedRewardComputer, BatchedTerminationChecker
 from finetune.motion_data.batched_motion_ref import BatchedMotionSet, BatchedRefFK
 from finetune.motion_data.motion_ref import MotionSet, RefFK
@@ -106,6 +107,23 @@ class BatchedG1MimicVecEnv(VecEnv):
             elif od.enabled:
                 print("[env] odom delay: no actor term has use_odom_delay, nothing to delay")
 
+        # IMU / AHRS error on the actor obs (terms with use_imu_error: true); critic keeps the truth
+        imu_terms = [t.name for t in self.actor_spec.terms
+                     if bool((t.params or {}).get("use_imu_error", False))]
+        ie = cfg.imu_error
+        self.imu: Optional[ImuErrorBuffer] = None
+        if ie.enabled and imu_terms:
+            # separate stream from the odometry RNG (same seed would correlate the two models)
+            self.imu = ImuErrorBuffer(N, imu_error_kwargs(ie), self.device, dt=self.control_dt,
+                                      seed=ec.seed + 1)
+        if verbose:
+            if self.imu is not None:
+                print(f"[env] {self.imu.describe()} -> {imu_terms}")
+            elif imu_terms:
+                print(f"[env] imu error OFF: actor terms {imu_terms} use the true IMU state")
+            elif ie.enabled:
+                print("[env] imu error: no actor term has use_imu_error, nothing to corrupt")
+
         if verbose:
             print(self.actor_builder.describe())
             print("critic " + self.critic_builder.describe())
@@ -134,6 +152,8 @@ class BatchedG1MimicVecEnv(VecEnv):
         robot = self.core.state()
         if self.odom is not None:
             self.odom.step(robot.root_pos, robot.root_quat)   # envs reset below are re-initialised
+        if self.imu is not None:
+            self.imu.step(robot.root_quat, robot.root_lin_vel_w)   # envs reset below are re-initialised
         ref_frame = self.motions.frame(self.mid, self.t)
         ref_body = self.motions.body_state(self.mid, self.t)
         rewards, raw = self.rewards(robot, ref_body, ref_frame.root_quat, self.last_action, self.prev_action,
@@ -229,6 +249,9 @@ class BatchedG1MimicVecEnv(VecEnv):
         if self.odom is not None:
             # fresh odometry at the reset pose, random update phase
             self.odom.init(ids, self.core.qpos[ids][:, 0:3], self.core.qpos[ids][:, 3:7])
+        if self.imu is not None:
+            # fresh IMU error (bias, misalignment, DR scale, AHRS tau) at the reset velocity
+            self.imu.init(ids, self.core.qvel[ids][:, 0:3])
 
         # deploy odom anchor: world origin latched at the robot root when the first reference
         # frame is published (t0 + mimic offset, or t0 when disabled)
@@ -284,7 +307,9 @@ class BatchedG1MimicVecEnv(VecEnv):
             motion_phase=torch.where(length > 0, self.t / length.clamp_min(1e-12),
                                      torch.ones_like(self.t)),
             time_left=(length - self.t).clamp_min(0.0),
-            est_pelvis=est_pelvis)
+            est_pelvis=est_pelvis,
+            imu_quat=self.imu.pelvis_quat(robot.root_quat) if self.imu is not None else None,
+            gyro_err=self.imu.gyro_error() if self.imu is not None else None)
 
     def _write_obs(self):
         ctx = self._context()
