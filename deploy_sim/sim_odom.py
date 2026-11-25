@@ -264,10 +264,10 @@ def main():
                    help="Frame the emulator reports (match --odom_frame: mid360 <-> lidar)")
     g.add_argument("--lio_rate", type=float, default=10.0)
     g.add_argument("--lio_grav", type=int, default=1, help="1: gravity-aligned odom frame (yaw only)")
-    g.add_argument("--lio_latency", type=float, default=0.0)
-    g.add_argument("--lio_latency_std", type=float, default=0.0)
-    g.add_argument("--lio_pos_std", type=float, default=0.0, help="[m]")
-    g.add_argument("--lio_rot_std", type=float, default=0.0, help="[deg]")
+    g.add_argument("--lio_latency", type=float, default=0.03)
+    g.add_argument("--lio_latency_std", type=float, default=0.008)
+    g.add_argument("--lio_pos_std", type=float, default=0.003, help="[m]")
+    g.add_argument("--lio_rot_std", type=float, default=0.1, help="[deg]")
     # LIO drift (random walk on scan-to-scan increments + per-launch bias); defaults ~ real FAST-LIO
     D = DRIFT_DEFAULTS
     g.add_argument("--lio_drift_xy_dist", type=float, default=D["xy_dist"], help="[m/sqrt(m)]")

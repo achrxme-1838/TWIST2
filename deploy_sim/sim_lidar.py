@@ -25,12 +25,12 @@ def _rotz2(yaw, v):
 
 DRIFT_DEFAULTS = dict(
     xy_dist=0.01,      # [m/sqrt(m)]     xy random walk per travelled distance  (100 m -> 10 cm, 1 sigma)
-    xy_time=0.001,     # [m/sqrt(s)]     xy random walk while standing          (60 s  -> 0.8 cm)
+    xy_time=0.0001,     # [m/sqrt(s)]     xy random walk while standing          (60 s  -> 0.8 cm)
     z_dist=0.005,      # [m/sqrt(m)]     z random walk per travelled distance   (100 m -> 5 cm)
     yaw_dist=0.05,     # [deg/sqrt(m)]   yaw random walk per travelled distance (100 m -> 0.5 deg)
     yaw_rot=0.03,      # [deg/sqrt(deg)] yaw random walk per rotated angle      (360 deg -> 0.57 deg)
     yaw_time=0.01,     # [deg/sqrt(s)]   yaw random walk while standing         (60 s  -> 0.08 deg)
-    scale_bias=0.5,    # [%]             std of the distance scale bias (sampled once per launch)
+    scale_bias=0.15,    # [%]             std of the distance scale bias (sampled once per launch)
     yaw_bias=0.01,     # [deg/m]         std of the heading bias        (sampled once per launch)
 )
 

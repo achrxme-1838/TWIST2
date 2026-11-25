@@ -1,4 +1,4 @@
-"""Optional ROS odometry I/O for the deployed G1 controllers (ROS2 rclpy or ROS1 rospy).
+"""Optional ROS odometry I/O for the deployed G1 controllers (ROS1 rospy or ROS2 rclpy).
 
 Groundwork for feeding the robot's *world* root pose into the ``diff_body_*``
 observation terms when ``--update_robot_w_odom`` is set:
@@ -7,8 +7,8 @@ observation terms when ``--update_robot_w_odom`` is set:
   * sim:  publish the MuJoCo GT root as ``nav_msgs/Odometry`` (so the same
     topic-based pipeline is exercised) and/or subscribe to it.
 
-Backend: ``rclpy`` (ROS2) is tried first; if it is not importable, ``rospy`` (ROS1
-Noetic, py3.8 -- same Python as the ``twist2`` conda env) is used. Both are imported
+Backend: ``rospy`` (ROS1 Noetic, py3.8 -- same Python as the ``twist2`` conda env) is
+tried first; if it is not importable, ``rclpy`` (ROS2) is used. Both are imported
 lazily so the default (non-odom) path works without any ROS. For ROS1, source the
 catkin / noetic ``setup.bash`` and set ``ROS_MASTER_URI`` / ``ROS_IP`` before launching
 (the conda env also needs ``pip install rospkg catkin_pkg``).
@@ -44,24 +44,24 @@ _initialized = False
 
 
 def _ensure_ros() -> bool:
-    """Try rclpy (ROS2), then rospy (ROS1), + nav_msgs once. Returns True on success."""
+    """Try rospy (ROS1), then rclpy (ROS2), + nav_msgs once. Returns True on success."""
     global _ROS_OK, _IMPORT_ERR, _BACKEND, _rclpy, _rospy, _Odometry
     if _ROS_OK is None:
         errs = []
         try:
-            import rclpy  # noqa: F401
+            import rospy  # noqa: F401
             from nav_msgs.msg import Odometry
 
-            _rclpy, _Odometry, _BACKEND = rclpy, Odometry, "ros2"
-        except Exception as e:  # ModuleNotFoundError in py3.8 twist2 env, etc.
-            errs.append(f"rclpy: {e!r}")
+            _rospy, _Odometry, _BACKEND = rospy, Odometry, "ros1"
+        except Exception as e:  # ROS1 not sourced, etc.
+            errs.append(f"rospy: {e!r}")
             try:
-                import rospy  # noqa: F401
+                import rclpy  # noqa: F401
                 from nav_msgs.msg import Odometry
 
-                _rospy, _Odometry, _BACKEND = rospy, Odometry, "ros1"
+                _rclpy, _Odometry, _BACKEND = rclpy, Odometry, "ros2"
             except Exception as e1:
-                errs.append(f"rospy: {e1!r}")
+                errs.append(f"rclpy: {e1!r}")
         _ROS_OK = _BACKEND is not None
         if _ROS_OK:
             print(f"[ros_odom] backend: {_BACKEND}")
@@ -73,7 +73,7 @@ def _ensure_ros() -> bool:
 def _require_ros():
     if not _ensure_ros():
         raise RuntimeError(
-            "neither rclpy (ROS2) nor rospy (ROS1) + nav_msgs is importable, so odometry "
+            "neither rospy (ROS1) nor rclpy (ROS2) + nav_msgs is importable, so odometry "
             "cannot be used in this environment. Launch the controller from a sourced ROS "
             "env (ROS1: devel/setup.bash + ROS_MASTER_URI; ROS2: Humble w/ matching Python). "
             f"Import errors: {_IMPORT_ERR}"

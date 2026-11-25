@@ -4,9 +4,15 @@
 #source ~/miniconda3/bin/activate twist2
 set -u
 SCRIPT_DIR=$(dirname $(realpath $0))
-ckpt=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+diff-pos-b+future-pos-h+future-anchor_upde-sig-per_mimic-body-w5.0_sig-init0.3sq.onnx}
-motion=${MOTION_NPZ:-${SCRIPT_DIR}/assets/motions/B3-walk1_poses.npz}
-stand=${STAND_NPZ:-${SCRIPT_DIR}/assets/motions/A1-Stand_poses.npz}
+
+ckpt=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+diff-pos-b+future-pos-anchor_hist25_rt-imu_odom-dly-drift_micpos-u-l-w3.02.0sig1e-42e-3_odom-dly-drift.onnx}
+# ckpt=${CKPT:-${SCRIPT_DIR}/assets/ckpts/ft/prop5+diff-pos-b+future-pos-anchor_hist25_rt-imu_odom-dly-drift_micpos-u-l-w3.02.0sig1e-42e-3_odom-dly-drift_ft3000.onnx}
+
+motion=${MOTION_NPZ:-${SCRIPT_DIR}/assets/motions/humanml_004669.npz}
+# motion=${MOTION_NPZ:-${SCRIPT_DIR}/assets/motions/humanml_002153.npz}
+
+stand=${STAND_NPZ:-${SCRIPT_DIR}/assets/motions/A1-Stand_poses_blend1.0.npz}
+
 cd "${SCRIPT_DIR}/deploy_sim"
 export LD_PRELOAD=/home/unitree/miniconda3/envs/twist2/lib/python3.8/site-packages/torch.libs/libgomp-804f19d4.so.1.0.0
 ${PY:-python} server_low_level_g1_real.py \

@@ -1,0 +1,39 @@
+future_steps: 10
+future_interval: 5
+terms:
+- name: base_ang_vel
+  history: 25
+  scale: 0.25
+  clip: [-100.0, 100.0]
+  params: {use_imu_error: true}
+- name: base_roll_pitch
+  history: 25
+  clip: [-100.0, 100.0]
+  params: {use_imu_error: true}
+- name: joint_pos_rel
+  history: 25
+  clip: [-100.0, 100.0]
+- name: joint_vel_rel
+  history: 25
+  scale: 0.05
+  clip: [-100.0, 100.0]
+  params:
+    mask_joint_names: [.*_ankle_pitch_joint, .*_ankle_roll_joint]
+- name: last_action
+  history: 25
+  clip: [-100.0, 100.0]
+- name: diff_body_pos_b
+  history: 25
+  scale: 1.0
+  params: {randomize_motion_ref_xyz: true, use_odom_delay: true, use_imu_error: true}
+- name: future_motion_pos_h
+  params: {num_steps: 1, use_odom_delay: true, use_imu_error: true}
+- name: future_motion_anchor
+  params: {num_steps: 1, use_odom_delay: true, use_imu_error: true}
+root: imu
+root_frame:
+  parent_body: pelvis
+  pos: [0.04525, 0.0, -0.08339]
+  quat: [1.0, 0.0, 0.0, 0.0]
+obs_dim: 4880
+source_run: distill_prop5+diff-pos-b+future-pos-anchor_hist25_rt-imu_odom-dly-drift_imu-error_micpos-u-l-w3.02.0sigmin1e-42e-3-odom-dly-drift_PHUMArt-v30ap0.99_2026-11-24_11-05-49

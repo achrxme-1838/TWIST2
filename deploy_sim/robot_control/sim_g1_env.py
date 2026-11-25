@@ -7,7 +7,7 @@ from odom_estimator import LIVOX_IMU_IN_MID360, MID360_IN_TORSO, pose, pose_mul,
 from utils.math import quat_mul
 
 SIM_DT = 0.001
-HOIST_KP_Z, HOIST_KD_Z, HOIST_SLACK = 3000.0, 300.0, 0.01   # [N/m, N s/m, m]
+HOIST_KP_Z, HOIST_KD_Z, HOIST_SLACK = 50000.0, 900.0, 0.01   # [N/m, N s/m, m]
 HOIST_KP_XY, HOIST_KD_XY = 300.0, 60.0
 HOIST_KP_ROT, HOIST_KD_ROT = 300.0, 30.0                    # [N m/rad, N m s/rad]
 WAIST_JOINTS = ("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint")
@@ -21,7 +21,7 @@ IMU_DEFAULTS = dict(
     gyro_bias_rw=2e-5,    # [rad/s/sqrt(s)] gyro bias random walk (bias instability)
     ahrs_tau=1.0,         # [s]           AHRS gravity-correction time constant (roll/pitch only)
     accel_tilt=1.0,       # [-]           gain of the linear-acceleration induced tilt error (0: off)
-    misalign=0.3,         # [deg]         std of the roll/pitch mounting misalignment (sampled once)
+    misalign=0.7,         # [deg]         std of the roll/pitch mounting misalignment (sampled once)
 )
 
 

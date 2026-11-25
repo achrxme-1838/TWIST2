@@ -24,7 +24,7 @@ from server_motion_lib import build_mimic_obs
 
 EXPORT_VERSION = 1
 CONTROL_DT = 0.02          # same as server_motion_lib.py
-RETURN_TIME = 2.0          # server_motion_lib.py time_back_to_default
+RETURN_TIME = 1.0          # server_motion_lib.py time_back_to_default
 YAW_INDEX = 5              # yaw field in the 38-dim mimic frame
 
 

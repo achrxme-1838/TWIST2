@@ -202,6 +202,7 @@ class RealTimePolicyController:
         # Policy was trained against cfg.DEFAULT_DOF_POS / STIFFNESS / DAMPING -- the PD hold
         # and the policy use the same gains.
         self.config.default_angles = cfg.DEFAULT_DOF_POS.astype(np.float32).copy()
+        # self.config.default_angles = cfg.DEFAULT_DOF_POS_STAND.astype(np.float32).copy()
         self.config.kps = (cfg.STIFFNESS.astype(np.float32) * kp_scale).tolist()
         self.config.kds = (cfg.DAMPING.astype(np.float32) * kd_scale).tolist()
         self.control_dt = float(self.config.control_dt)
@@ -218,6 +219,7 @@ class RealTimePolicyController:
 
         self.num_actions = cfg.NUM_ACTIONS
         self.default_dof_pos = cfg.DEFAULT_DOF_POS.copy()
+        # self.default_dof_pos = cfg.DEFAULT_DOF_POS_STAND.copy()
         self.action_scale = np.full(self.num_actions, cfg.ACTION_SCALE, dtype=np.float32)
         self.sdk_to_isaac = np.array([cfg.SDK_JOINT_NAMES.index(n) for n in cfg.ISAAC_JOINT_NAMES], dtype=np.int64)
         self.isaac_to_sdk = np.array([cfg.ISAAC_JOINT_NAMES.index(n) for n in cfg.SDK_JOINT_NAMES], dtype=np.int64)
@@ -404,10 +406,13 @@ class RealTimePolicyController:
             else:
                 self._start_motion(now)
 
-    def _play(self, player, blend_from, blend_from_xy):
+    def _play(self, player, blend_from, blend_from_xy, xy_offset=None, yaw_offset=0.0):
         """Start a player with its frame 0 anchored on the robot: heading -> robot yaw in G,
         frame 0's point X -> robot X xy in G. The blend starts from (blend_from, blend_from_xy)."""
         xy, yaw = self.est.point_in_G()
+        yaw += yaw_offset
+        if xy_offset is not None:
+            xy = np.asarray(xy, dtype=np.float64) + np.asarray(xy_offset, dtype=np.float64)
         player.start(yaw, blend_from=blend_from)
         p0, rpy0 = player.frame0_root()
         off = self.chain.point_offset_xy(rpy_to_quat(*rpy0), self.origin_ref)
@@ -434,7 +439,7 @@ class RealTimePolicyController:
         start[3] = start[4] = 0.0
         start[5] = yaw
         start_xy = np.asarray(xy, dtype=np.float64) - self.chain.point_offset_xy(yaw_quat(yaw), self.origin_ref)
-        self._play(self.stand_player, start, start_xy)
+        self._play(self.stand_player, start, start_xy, xy_offset=(0.0, 0.0), yaw_offset=np.deg2rad(0.0))
         self.state = STAND
         self._say(now, "a", f"[A] policy start (gain {self.initial_gain_scale * 100:.0f}%) on the stand motion "
                             f"({self.stand_player.n_blend} blend + {self.stand_player.num_steps} steps, then held)",
