@@ -10,6 +10,7 @@ ckpt=${CKPT:-${SCRIPT_DIR}/assets/ckpts/prop5+diff-pos-b+future-pos-anchor_hist2
 
 motion=${MOTION_NPZ:-${SCRIPT_DIR}/assets/motions/humanml_004669.npz}
 # motion=${MOTION_NPZ:-${SCRIPT_DIR}/assets/motions/humanml_002153.npz}
+# motion=${MOTION_NPZ:-${SCRIPT_DIR}/assets/motions/humanml_011875.npz}
 
 stand=${STAND_NPZ:-${SCRIPT_DIR}/assets/motions/A1-Stand_poses_blend1.0.npz}
 
