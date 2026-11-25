@@ -2,7 +2,8 @@
 """TWIST2 G1 controller: LIO odometry (livox IMU frame) + a global origin set at A.
   S (START)   move to the default pose, then hold it with PD (100%, robot on the hoist)
   (LIO)       start the LIO outside this script (sim: key L launches the emulator)
-  A           set the global origin G at the current robot pose (refused only on stale odometry),
+  A           set the global origin G at the current robot pose (requires fresh odometry and
+              pelvis/IMU gravity agreement within 30 degrees),
               start the policy (gain --initial_gain_scale, default 100%) on the stand motion
               (--stand_npz) anchored on the robot: blend -> play -> hold its last frame (STAND)
   B           after the stand / a motion has finished: play the motion (--motion_npz), frame 0 anchored

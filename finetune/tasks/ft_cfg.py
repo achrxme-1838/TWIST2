@@ -186,6 +186,10 @@ class OdomDelayCfg:
     init_yaw_dev: float = 1.0            # [deg]
 
 
+# @dataclass
+# class ImuErrorCfg:
+
+
 @dataclass
 class TerminationCfg:
     max_ref_motion_dist: float = 0.5
