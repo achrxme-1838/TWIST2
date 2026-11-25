@@ -55,6 +55,19 @@ def roll_pitch(q):
     return float(roll), float(pitch)
 
 
+def gravity_error(q1, q2):
+    """Angle between world-up vectors expressed in the pelvis (yaw independent)."""
+    up = np.array([0.0, 0.0, 1.0])
+    directions = []
+    for q in (q1, q2):
+        q = np.asarray(q, dtype=np.float64)
+        norm = np.linalg.norm(q)
+        if not np.isfinite(norm) or norm < 1e-8:
+            return np.inf
+        directions.append(quat_apply(quat_conj(q / norm), up))
+    return float(np.arccos(np.clip(np.dot(*directions), -1.0, 1.0)))
+
+
 IDENTITY = (np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0]))
 
 
@@ -130,7 +143,7 @@ class OdomEstimator:
                  sync="stamp", sync_tol=0.1, v_max=4.0, yaw_rate_max=8.0,
                  origin_window=0.5, origin_min_samples=3, origin_pos_std=0.01,
                  origin_yaw_std=np.deg2rad(1.0), feet_dz_max=0.02, grav_warn=np.deg2rad(2.0),
-                 origin_strict=False):
+                 origin_strict=False, grav_reject=np.deg2rad(30.0)):
         if origin_ref not in ORIGIN_REFS:
             raise ValueError(f"origin_ref must be one of {ORIGIN_REFS}")
         self.chain = chain
@@ -146,6 +159,7 @@ class OdomEstimator:
         self.origin_yaw_std = float(origin_yaw_std)
         self.feet_dz_max = float(feet_dz_max)
         self.grav_warn = float(grav_warn)
+        self.grav_reject = float(grav_reject)
         self.origin_strict = bool(origin_strict)
 
         self._joints = deque(maxlen=200)              # (t, dof_pos)
@@ -220,8 +234,9 @@ class OdomEstimator:
     # ----- global origin (A button) -----
     def reset_origin(self, now, dof_pos, imu_quat):
         """Latch T^W_G from the last origin_window seconds. Returns (ok, message).
-        Refused only on stale odometry unless origin_strict (then also on too few samples,
-        a moving robot or uneven feet -- otherwise those are warnings)."""
+        Refused on stale odometry or a large pelvis/IMU gravity mismatch, before
+        changing the origin. origin_strict also refuses too few samples, a moving
+        robot or uneven feet -- otherwise those are warnings."""
         if not self.fresh(now):
             return False, f"odometry not fresh (age {self.age(now) * 1e3:.0f} ms)"
         warns = []
@@ -244,6 +259,17 @@ class OdomEstimator:
                 return False, w
             warns.append(w)
         imu_roll, imu_pitch = roll_pitch(imu_quat)
+        # Test the converted PELVIS orientation, not the raw sensor orientation:
+        # a correctly configured upside-down sensor must still yield upright pelvis.
+        odom_quat = samples[-1][1][1]
+        o_roll, o_pitch = roll_pitch(odom_quat)
+        g_err = gravity_error(odom_quat, imu_quat)
+        gravity_msg = (f"odom pelvis vs IMU gravity differ by {np.rad2deg(g_err):.1f} deg "
+                       f"(odom r/p {np.rad2deg(o_roll):+.1f}/{np.rad2deg(o_pitch):+.1f}, "
+                       f"IMU r/p {np.rad2deg(imu_roll):+.1f}/{np.rad2deg(imu_pitch):+.1f} deg)")
+        if not np.isfinite(g_err) or g_err > self.grav_reject:
+            return False, (f"{gravity_msg}; check the odometry child pose (--odom_frame), "
+                           "sensor mounting extrinsics and world gravity alignment before starting the policy")
         h, foot_dz = self.chain.height_above_feet(dof_pos, imu_roll, imu_pitch, which)
         if foot_dz > self.feet_dz_max:
             w = f"feet not level ({foot_dz * 1e3:.0f} mm > {self.feet_dz_max * 1e3:.0f} mm)"
@@ -253,14 +279,10 @@ class OdomEstimator:
         p = P.mean(axis=0)
         self.T_W_G = (np.array([p[0], p[1], p[2] - h]), yaw_quat(yaw_mean))
         self.origin_count += 1
-        # Gravity alignment check of W: odom roll/pitch vs IMU roll/pitch.
-        o_roll, o_pitch = roll_pitch(samples[-1][1][1])
-        g_err = max(abs(wrap(o_roll - imu_roll)), abs(wrap(o_pitch - imu_pitch)))
         msg = (f"origin #{self.origin_count} ({which}): W xyz [{p[0]:+.3f} {p[1]:+.3f} {p[2] - h:+.3f}] "
                f"yaw {np.rad2deg(yaw_mean):+.1f} deg, {which} height {h:.3f} m, {len(samples)} samples")
         if g_err > self.grav_warn:
-            msg += (f"  [WARN] odom vs IMU roll/pitch differ by {np.rad2deg(g_err):.1f} deg "
-                    f"-- is the odom frame gravity aligned?")
+            msg += f"  [WARN] {gravity_msg}; check the odometry frame and mounting extrinsics"
         if warns:
             msg += "  [WARN] " + "; ".join(warns)
         self._pos_ma.clear()
